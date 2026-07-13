@@ -1,9 +1,12 @@
-# SupertrendPro Institutional V5.0.2 — Matplotlib-Free Table Fix
+# CommodityMacroPro Institutional V1.0.2
 
-Fixes Streamlit Cloud error:
-`ImportError: background_gradient requires matplotlib.`
+Cloud-stable Streamlit application for daily Yahoo Finance analysis of Gold, Silver, Platinum, WTI Crude Oil, Copper, DXY and US Treasury 10Y yield.
 
-The institutional table gradient is now generated with plain CSS through
-`pandas.Styler.apply`; matplotlib is no longer required. Existing calculations,
-tabs, charts, Yahoo Finance data flow, TA-Lib selection and hedge-fund styling
-are preserved.
+## Hotfix 1.0.2
+
+- Commodity project only; no equity/SupertrendPro code.
+- Removed every pandas `Styler` table path.
+- No `background_gradient` call and no matplotlib dependency.
+- Tables use Streamlit `column_config.NumberColumn` formatting.
+- Preserves the nine institutional tabs, Yahoo Finance-only policy, EWMA volatility, DXY relationship, log-return difference bands and walk-forward forecast engine.
+- Keeps cloud-stable NumPy 1.26.4 and PyArrow 18.1.0 pins.

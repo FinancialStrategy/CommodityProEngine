@@ -1,68 +1,77 @@
 # -*- coding: utf-8 -*-
-# -------------------------------------------------------------------------
-# SUPERTRENDPRO INSTITUTIONAL V5.0.2 – NO SYNTHETIC DATA + LEADING SIGNAL LAB
-# Trend Following + Smart Supertrend + Beta + Risk Metrics
-# Expanded BIST Blue-Chip Universe + Capital Gain Leaders Lab
-# -------------------------------------------------------------------------
-# Save as: app.py
-# Run:
-#   streamlit run app.py --server.port 8516
-# -------------------------------------------------------------------------
+"""
+CommodityMacroPro Institutional V1.0
+------------------------------------
+Daily Yahoo Finance data only. No synthetic prices, no proxy series.
+Universe: Gold, Silver, Platinum, WTI Crude Oil, Copper, DXY and US Treasury 10Y yield.
 
-import warnings
-warnings.filterwarnings("ignore")
+Run:
+    streamlit run app.py
+"""
 
 import os
-
+import gc
+import math
+import warnings
 from datetime import datetime
+
+# Streamlit Cloud stability: prevent BLAS/OpenMP oversubscription during repeated
+# walk-forward Ridge/OLS fits. These variables must be set before NumPy/SciPy import.
+for _thread_env in (
+    'OMP_NUM_THREADS',
+    'OPENBLAS_NUM_THREADS',
+    'MKL_NUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+    'VECLIB_MAXIMUM_THREADS',
+    'BLIS_NUM_THREADS',
+):
+    os.environ[_thread_env] = '1'
 from typing import Dict, List, Optional, Tuple
+
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-import itertools
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.preprocessing import StandardScaler
+from threadpoolctl import threadpool_limits
 
-# -------------------------------------------------------------------------
-# INDICATOR ENGINE: TA-Lib is automatically preferred when installed.
-# The user can explicitly select Auto, TA-Lib, or Pandas/NumPy in the sidebar.
-# No synthetic prices are ever generated; only indicator formulas can fall back.
-# -------------------------------------------------------------------------
-try:
-    import talib as ta
-    TALIB_INSTALLED = True
-    TALIB_VERSION = getattr(ta, "__version__", "installed")
-    TALIB_IMPORT_ERROR = ""
-except Exception as exc:
-    ta = None
-    TALIB_INSTALLED = False
-    TALIB_VERSION = "not installed"
-    TALIB_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
-
-# This runtime flag is resolved from the sidebar before any market data is processed.
-TALIB_AVAILABLE = False
-ACTIVE_INDICATOR_ENGINE = "Pandas / NumPy"
-
+# -----------------------------------------------------------------------------
+# APPLICATION CONFIGURATION
+# -----------------------------------------------------------------------------
+APP_VERSION = "1.0.2"
+APP_NAME = "CommodityMacroPro Institutional"
 TRADING_DAYS = 252
-ROLLING_BETA_WINDOW = 60
-ROLLING_VOL_WINDOW = 63
-MIN_PRICE_OBS = 120
-BENCHMARK_SYMBOL = "XU100.IS"
-APP_VERSION = "5.0.2"
-APP_RELEASE_NAME = "SupertrendPro Institutional V5.0.2"
+DXY_TICKER = "DX-Y.NYB"
+TNX_TICKER = "^TNX"
+
+INSTRUMENTS: Dict[str, Dict[str, str]] = {
+    "Gold Futures": {"ticker": "GC=F", "short": "Gold", "type": "commodity", "unit": "USD/oz"},
+    "Silver Futures": {"ticker": "SI=F", "short": "Silver", "type": "commodity", "unit": "USD/oz"},
+    "Platinum Futures": {"ticker": "PL=F", "short": "Platinum", "type": "commodity", "unit": "USD/oz"},
+    "WTI Crude Oil Futures": {"ticker": "CL=F", "short": "WTI Oil", "type": "commodity", "unit": "USD/bbl"},
+    "Copper Futures": {"ticker": "HG=F", "short": "Copper", "type": "commodity", "unit": "USD/lb"},
+    "US Dollar Index": {"ticker": DXY_TICKER, "short": "DXY", "type": "index", "unit": "Index"},
+    "US Treasury 10Y Yield": {"ticker": TNX_TICKER, "short": "UST 10Y", "type": "yield", "unit": "%"},
+}
+COMMODITY_NAMES = [k for k, v in INSTRUMENTS.items() if v["type"] == "commodity"]
+TICKER_TO_NAME = {v["ticker"]: k for k, v in INSTRUMENTS.items()}
 
 st.set_page_config(
+    page_title=f"{APP_NAME} V{APP_VERSION}",
+    page_icon="◆",
     layout="wide",
-    page_title="SupertrendPro Institutional V5.0.2",
     initial_sidebar_state="expanded",
 )
 
-# -------------------------------------------------------------------------
-# STYLING
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# HEDGE-FUND STYLE
+# -----------------------------------------------------------------------------
 st.markdown(
     """
     <style>
@@ -74,92 +83,44 @@ st.markdown(
         --hf-soft: #f6f8fa;
         --hf-white: #ffffff;
         --hf-accent: #214b73;
+        --hf-green: #176b45;
+        --hf-red: #9f2d2d;
       }
-
       html, body, [class*="css"] {
         font-family: "Inter", "Aptos", "Segoe UI", Arial, sans-serif;
         color: var(--hf-navy);
       }
-
-      .stApp {
-        background: var(--hf-white);
-      }
-
+      .stApp { background: var(--hf-white); }
       .block-container {
-        max-width: 1680px;
-        padding-top: 1.15rem;
-        padding-bottom: 2.5rem;
+        max-width: 1740px;
+        padding-top: 1.0rem;
+        padding-bottom: 2.6rem;
         padding-left: 2rem;
         padding-right: 2rem;
       }
-
       h1, h2, h3, h4, h5, h6 {
-        font-family: "Inter", "Aptos", "Segoe UI", Arial, sans-serif;
         color: var(--hf-navy);
         letter-spacing: -0.025em;
       }
-
-      h1 {
-        font-size: 2.00rem !important;
-        line-height: 1.18 !important;
-        font-weight: 300 !important;
-        margin-bottom: 0.35rem !important;
-      }
-
-      h2 {
-        font-size: 1.45rem !important;
-        line-height: 1.25 !important;
-        font-weight: 350 !important;
-        margin-top: 1.55rem !important;
-        margin-bottom: 0.55rem !important;
-      }
-
-      h3 {
-        font-size: 1.10rem !important;
-        line-height: 1.30 !important;
-        font-weight: 450 !important;
-        margin-top: 1.30rem !important;
-        margin-bottom: 0.45rem !important;
-      }
-
-      h4 {
-        font-size: 0.95rem !important;
-        font-weight: 500 !important;
-        letter-spacing: 0.01em !important;
-      }
-
-      p, label, .stMarkdown, .stCaption {
-        color: var(--hf-slate);
-      }
-
-      hr {
-        border: 0;
-        border-top: 1px solid var(--hf-border);
-        margin: 1.25rem 0 1.35rem 0;
-      }
+      h1 { font-size: 2.0rem !important; font-weight: 300 !important; }
+      h2 { font-size: 1.42rem !important; font-weight: 350 !important; margin-top: 1.3rem !important; }
+      h3 { font-size: 1.08rem !important; font-weight: 450 !important; }
+      p, label, .stMarkdown, .stCaption { color: var(--hf-slate); }
+      hr { border: 0; border-top: 1px solid var(--hf-border); margin: 1.15rem 0 1.25rem 0; }
 
       .hf-masthead {
-        margin: 0.15rem 0 1.10rem 0;
-        padding: 0.15rem 0 1.05rem 0;
+        margin: 0.10rem 0 1.0rem 0;
+        padding: 0.10rem 0 1.0rem 0;
         border-bottom: 1px solid var(--hf-border);
       }
-
       .hf-eyebrow {
-        font-size: 0.68rem;
+        font-size: 0.66rem;
         font-weight: 600;
         letter-spacing: 0.18em;
         text-transform: uppercase;
         color: var(--hf-muted);
-        margin-bottom: 0.48rem;
+        margin-bottom: 0.45rem;
       }
-
-      .hf-brand-row {
-        display: flex;
-        align-items: baseline;
-        gap: 0.70rem;
-        flex-wrap: wrap;
-      }
-
       .hf-title {
         font-size: 2.05rem;
         line-height: 1.12;
@@ -167,2478 +128,1323 @@ st.markdown(
         letter-spacing: -0.045em;
         color: var(--hf-navy);
       }
-
       .hf-version {
-        font-size: 0.72rem;
-        font-weight: 500;
-        letter-spacing: 0.08em;
+        font-size: 0.70rem;
+        font-weight: 600;
+        letter-spacing: 0.09em;
         color: var(--hf-accent);
         text-transform: uppercase;
+        margin-left: 0.55rem;
       }
-
       .hf-meta {
-        margin-top: 0.48rem;
-        font-size: 0.78rem;
-        font-weight: 400;
-        letter-spacing: 0.045em;
+        margin-top: 0.45rem;
+        font-size: 0.76rem;
         color: var(--hf-muted);
+        letter-spacing: 0.035em;
       }
-
       .instrument-header {
-        margin: 1.25rem 0 0.85rem 0;
-        padding: 0 0 0.85rem 0;
+        margin: 1.05rem 0 0.75rem 0;
+        padding-bottom: 0.75rem;
         border-bottom: 1px solid var(--hf-border);
       }
-
       .instrument-kicker {
-        font-size: 0.64rem;
-        line-height: 1;
+        font-size: 0.62rem;
         font-weight: 600;
         letter-spacing: 0.16em;
         text-transform: uppercase;
         color: var(--hf-muted);
-        margin-bottom: 0.42rem;
       }
-
       .instrument-title {
-        font-size: 1.65rem;
-        line-height: 1.20;
+        margin-top: 0.30rem;
+        font-size: 1.60rem;
         font-weight: 350;
         letter-spacing: -0.035em;
         color: var(--hf-navy);
       }
-
       .instrument-title span {
-        font-size: 0.82rem;
-        font-weight: 500;
+        font-size: 0.78rem;
+        font-weight: 600;
         letter-spacing: 0.06em;
         color: var(--hf-accent);
         margin-left: 0.35rem;
       }
-
       .instrument-subtitle {
-        margin-top: 0.32rem;
-        font-size: 0.76rem;
-        font-weight: 400;
+        margin-top: 0.25rem;
+        font-size: 0.74rem;
         color: var(--hf-muted);
-        letter-spacing: 0.025em;
       }
-
+      .section-note {
+        border-left: 2px solid var(--hf-accent);
+        padding: 0.55rem 0.8rem;
+        margin: 0.55rem 0 1.0rem 0;
+        font-size: 0.78rem;
+        color: var(--hf-slate);
+        background: #fafbfc;
+      }
       div[data-testid="stMetric"] {
         background: var(--hf-white);
         border: 1px solid var(--hf-border);
-        border-radius: 4px;
-        padding: 0.72rem 0.82rem 0.66rem 0.82rem;
+        border-radius: 3px;
+        padding: 0.70rem 0.80rem 0.64rem 0.80rem;
         box-shadow: none;
       }
-
       div[data-testid="stMetricLabel"] {
-        font-size: 0.66rem !important;
+        font-size: 0.64rem !important;
         font-weight: 600 !important;
         letter-spacing: 0.075em !important;
         text-transform: uppercase;
         color: var(--hf-muted) !important;
       }
-
       div[data-testid="stMetricValue"] {
-        font-size: 1.30rem !important;
-        line-height: 1.12 !important;
+        font-size: 1.24rem !important;
         font-weight: 400 !important;
         color: var(--hf-navy) !important;
       }
-
-      div[data-testid="stMetricDelta"] {
-        font-size: 0.72rem !important;
-        font-weight: 500 !important;
-      }
-
       div[data-testid="stTabs"] button {
-        min-height: 2.55rem;
-        padding: 0.30rem 0.72rem;
+        min-height: 2.60rem;
+        padding: 0.30rem 0.64rem;
         border-radius: 0;
-      }
-
-      div[data-testid="stTabs"] button p {
-        font-size: 0.68rem !important;
-        font-weight: 550 !important;
-        letter-spacing: 0.055em !important;
+        font-size: 0.67rem;
+        font-weight: 600;
+        letter-spacing: 0.065em;
         text-transform: uppercase;
-        color: var(--hf-muted) !important;
       }
-
       div[data-testid="stTabs"] button[aria-selected="true"] {
-        border-bottom: 2px solid var(--hf-navy) !important;
-      }
-
-      div[data-testid="stTabs"] button[aria-selected="true"] p {
-        color: var(--hf-navy) !important;
-      }
-
-      section[data-testid="stSidebar"] {
-        background: #f8fafc;
-        border-right: 1px solid var(--hf-border);
-      }
-
-      section[data-testid="stSidebar"] h1,
-      section[data-testid="stSidebar"] h2,
-      section[data-testid="stSidebar"] h3 {
-        font-weight: 400 !important;
-      }
-
-      section[data-testid="stSidebar"] label,
-      section[data-testid="stSidebar"] p {
-        font-size: 0.78rem;
-      }
-
-      .small-note {
-        font-size: 0.76rem;
-        line-height: 1.55;
-        color: var(--hf-muted);
-      }
-
-      .risk-note,
-      .ok-note {
-        padding: 0.78rem 0.92rem;
-        border-radius: 3px;
-        font-size: 0.78rem;
-        line-height: 1.50;
-      }
-
-      .risk-note {
-        background: #fffaf3;
-        border: 1px solid #eadbc8;
-        color: #6b4f33;
-      }
-
-      .ok-note {
-        background: #f4f8f6;
-        border: 1px solid #cfddd5;
-        color: #315244;
-      }
-
-      .stButton > button,
-      .stDownloadButton > button {
-        border-radius: 3px;
-        border: 1px solid #cfd6de;
-        background: #ffffff;
         color: var(--hf-navy);
-        font-size: 0.72rem;
-        font-weight: 550;
-        letter-spacing: 0.045em;
-        text-transform: uppercase;
-        box-shadow: none;
+        border-bottom: 2px solid var(--hf-accent);
       }
-
-      .stButton > button:hover,
-      .stDownloadButton > button:hover {
-        border-color: var(--hf-accent);
-        color: var(--hf-accent);
+      section[data-testid="stSidebar"] {
+        border-right: 1px solid var(--hf-border);
+        background: #fbfcfd;
       }
-
-      div[data-testid="stDataFrame"] {
+      .stButton > button, .stDownloadButton > button {
         border: 1px solid var(--hf-border);
         border-radius: 3px;
-        overflow: hidden;
+        background: var(--hf-white);
+        color: var(--hf-navy);
+        font-size: 0.72rem;
+        font-weight: 600;
+        letter-spacing: 0.035em;
       }
-
-      div[data-testid="stAlert"] {
-        border-radius: 3px;
-        border-width: 1px;
-      }
-
-      .stCaptionContainer,
-      [data-testid="stCaptionContainer"] {
-        font-size: 0.72rem !important;
-        color: var(--hf-muted) !important;
-      }
+      .stDataFrame { border: 1px solid var(--hf-border); }
+      .positive { color: var(--hf-green); }
+      .negative { color: var(--hf-red); }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# -------------------------------------------------------------------------
-# MARKET UNIVERSE – EXPANDED BIST BLUE CHIPS + USER'S CAPITAL GAIN LIST
-# No synthetic data: tickers are used only to fetch real Yahoo Finance data.
-# -------------------------------------------------------------------------
-MARKET_DATA: Dict[str, Dict[str, str]] = {
-    "Indices": {
-        "BIST 100 Index": "XU100.IS",
-        "BIST 30 Index": "XU030.IS",
-        "BIST Bank Index": "XBANK.IS",
-        "BIST Industrial Index": "XUSIN.IS",
-        "BIST Holding & Investment Index": "XHOLD.IS",
-    },
-    "Major Banks & Financials": {
-        "Akbank": "AKBNK.IS",
-        "Garanti BBVA": "GARAN.IS",
-        "Is Bankasi (C)": "ISCTR.IS",
-        "Yapi Kredi": "YKBNK.IS",
-        "QNB Bank": "QNBTR.IS",
-        "VakifBank": "VAKBN.IS",
-        "Halkbank": "HALKB.IS",
-        "TSKB": "TSKB.IS",
-        "Albaraka Turk": "ALBRK.IS",
-        "Sekerbank": "SKBNK.IS",
-        "Turkiye Sigorta": "TURSG.IS",
-        "Anadolu Hayat Emeklilik": "ANHYT.IS",
-        "Aksigorta": "AKGRT.IS",
-        "Ray Sigorta": "RAYSG.IS",
-        "Is Leasing": "ISFIN.IS",
-        "Garanti Factoring": "GARFA.IS",
-        "Vakif Leasing": "VAKFN.IS",
-        "Lider Factoring": "LIDFA.IS",
-    },
-    "Holdings & Conglomerates": {
-        "Koc Holding": "KCHOL.IS",
-        "Sabanci Holding": "SAHOL.IS",
-        "Anadolu Grubu Holding": "AGHOL.IS",
-        "Dogus Otomotiv": "DOAS.IS",
-        "GSD Holding": "GSDHO.IS",
-        "Bera Holding": "BERA.IS",
-        "Eczacibasi Yatirim": "ECZYT.IS",
-        "Is Yatirim Menkul": "ISMEN.IS",
-    },
-    "Transport, Aviation & Tourism": {
-        "Turkish Airlines": "THYAO.IS",
-        "Pegasus Airlines": "PGSUS.IS",
-        "TAV Airports": "TAVHL.IS",
-        "Tureks Turizm": "TUREX.IS",
-        "Merit Turizm": "MERIT.IS",
-    },
-    "Industrial Blue Chips": {
-        "Tupras": "TUPRS.IS",
-        "Aselsan": "ASELS.IS",
-        "Eregli Steel": "EREGL.IS",
-        "Kardemir D": "KRDMD.IS",
-        "Kardemir A": "KRDMA.IS",
-        "Ford Otosan": "FROTO.IS",
-        "Tofas Auto": "TOASO.IS",
-        "Arcelik": "ARCLK.IS",
-        "Sisecam": "SISE.IS",
-        "Enka Construction": "ENKAI.IS",
-        "Brisa": "BRISA.IS",
-        "Karsan": "KARSN.IS",
-        "Erbosan": "ERBOS.IS",
-    },
-    "Consumer, Retail & Food": {
-        "BIM Markets": "BIMAS.IS",
-        "Migros": "MGROS.IS",
-        "Coca-Cola Icecek": "CCOLA.IS",
-        "Ulker Biskuvi": "ULKER.IS",
-        "Mavi Giyim": "MAVI.IS",
-        "Desa Deri": "DESA.IS",
-        "Kervan Gida": "KRVGD.IS",
-        "Konfrut Gida": "KNFRT.IS",
-        "Besler Gida": "BESLR.IS",
-        "Aygaz": "AYGAZ.IS",
-        "Sok Marketler": "SOKM.IS",
-        "Anadolu Efes": "AEFES.IS",
-    },
-    "Technology & Telecom": {
-        "Turkcell": "TCELL.IS",
-        "Turk Telekom": "TTKOM.IS",
-        "Logo Yazilim": "LOGO.IS",
-        "Link Bilgisayar": "LINK.IS",
-        "Penta Teknoloji": "PENTA.IS",
-        "Escort Teknoloji": "ESCOM.IS",
-        "Kron Teknoloji": "KRONT.IS",
-        "Indeks Bilgisayar": "INDES.IS",
-    },
-    "Energy, Materials & Construction": {
-        "Astor Energy": "ASTOR.IS",
-        "Sasa Polyester": "SASA.IS",
-        "Hektas": "HEKTS.IS",
-        "Petkim": "PETKM.IS",
-        "Koza Altin": "KOZAL.IS",
-        "Smart Gunes": "SMRTG.IS",
-        "Eupower Enerji": "EUPWR.IS",
-        "Gesan": "GESAN.IS",
-        "Kalekim": "KLKIM.IS",
-        "QUA Granite": "QUAGR.IS",
-        "Kütahya Porselen": "KUTPO.IS",
-    },
-    "Real Estate & Other": {
-        "Torunlar GYO": "TRGYO.IS",
-        "Servet GYO": "SRVGY.IS",
-        "Emlak Konut GYO": "EKGYO.IS",
-        "Ozak GYO": "OZKGY.IS",
-        "MLP Saglik": "MPARK.IS",
-    },
-}
-
-# User-provided top capital-gain list as a fixed screener basket.
-# These snapshot fields are metadata only. Time-series calculations use real Yahoo data.
-CAPITAL_GAIN_LEADERS = [
-    {"Name": "Tureks Turizm Tasimacilik", "Symbol": "TUREX.IS", "SnapshotPrice": 6.86, "SnapshotGainPct": 65.73, "SnapshotTarget": 11.37, "Rating": "Very Good"},
-    {"Name": "Link Bilgisayar", "Symbol": "LINK.IS", "SnapshotPrice": 6.94, "SnapshotGainPct": 60.90, "SnapshotTarget": 11.15, "Rating": "Excellent"},
-    {"Name": "Kalekim", "Symbol": "KLKIM.IS", "SnapshotPrice": 27.12, "SnapshotGainPct": 58.26, "SnapshotTarget": 42.89, "Rating": "Very Good"},
-    {"Name": "Kutahya Porselen", "Symbol": "KUTPO.IS", "SnapshotPrice": 84.50, "SnapshotGainPct": 57.91, "SnapshotTarget": 133.434, "Rating": "Good"},
-    {"Name": "Aygaz", "Symbol": "AYGAZ.IS", "SnapshotPrice": 232.80, "SnapshotGainPct": 56.96, "SnapshotTarget": 365.09, "Rating": "Good"},
-    {"Name": "Besler Gida", "Symbol": "BESLR.IS", "SnapshotPrice": 13.18, "SnapshotGainPct": 54.38, "SnapshotTarget": 20.35, "Rating": "Good"},
-    {"Name": "QUA Granite", "Symbol": "QUAGR.IS", "SnapshotPrice": 3.49, "SnapshotGainPct": 53.31, "SnapshotTarget": 5.35, "Rating": "Fair"},
-    {"Name": "Servet GYO", "Symbol": "SRVGY.IS", "SnapshotPrice": 2.64, "SnapshotGainPct": 51.76, "SnapshotTarget": 3.991, "Rating": "Good"},
-    {"Name": "Mavi Giyim", "Symbol": "MAVI.IS", "SnapshotPrice": 37.88, "SnapshotGainPct": 51.57, "SnapshotTarget": 57.35, "Rating": "Very Good"},
-    {"Name": "Desa Deri", "Symbol": "DESA.IS", "SnapshotPrice": 10.43, "SnapshotGainPct": 48.08, "SnapshotTarget": 15.46, "Rating": "Very Good"},
-    {"Name": "Ford Otosan", "Symbol": "FROTO.IS", "SnapshotPrice": 81.05, "SnapshotGainPct": 47.65, "SnapshotTarget": 119.74, "Rating": "Very Good"},
-    {"Name": "Penta Teknoloji", "Symbol": "PENTA.IS", "SnapshotPrice": 13.27, "SnapshotGainPct": 47.57, "SnapshotTarget": 19.58, "Rating": "Very Good"},
-    {"Name": "Ray Sigorta", "Symbol": "RAYSG.IS", "SnapshotPrice": 177.90, "SnapshotGainPct": 47.06, "SnapshotTarget": 261.62, "Rating": "Excellent"},
-    {"Name": "Is Bankasi C", "Symbol": "ISCTR.IS", "SnapshotPrice": 14.19, "SnapshotGainPct": 46.25, "SnapshotTarget": 20.753, "Rating": "Good"},
-    {"Name": "Kardemir D", "Symbol": "KRDMD.IS", "SnapshotPrice": 36.82, "SnapshotGainPct": 46.21, "SnapshotTarget": 53.864, "Rating": "Good"},
-    {"Name": "Logo Yazilim", "Symbol": "LOGO.IS", "SnapshotPrice": 138.20, "SnapshotGainPct": 45.47, "SnapshotTarget": 201.04, "Rating": "Very Good"},
-    {"Name": "Escort Teknoloji", "Symbol": "ESCOM.IS", "SnapshotPrice": 6.14, "SnapshotGainPct": 45.40, "SnapshotTarget": 8.91, "Rating": "Very Good"},
-    {"Name": "Karsan", "Symbol": "KARSN.IS", "SnapshotPrice": 11.96, "SnapshotGainPct": 44.34, "SnapshotTarget": 17.277, "Rating": "Excellent"},
-    {"Name": "Konfrut Gida", "Symbol": "KNFRT.IS", "SnapshotPrice": 11.88, "SnapshotGainPct": 42.97, "SnapshotTarget": 16.98, "Rating": "Fair"},
-    {"Name": "Erbosan", "Symbol": "ERBOS.IS", "SnapshotPrice": 169.50, "SnapshotGainPct": 40.96, "SnapshotTarget": 238.93, "Rating": "Good"},
-    {"Name": "Kardemir A", "Symbol": "KRDMA.IS", "SnapshotPrice": 38.18, "SnapshotGainPct": 40.91, "SnapshotTarget": 53.799, "Rating": "Good"},
-    {"Name": "Merit Turizm", "Symbol": "MERIT.IS", "SnapshotPrice": 17.99, "SnapshotGainPct": 39.62, "SnapshotTarget": 25.006, "Rating": "Excellent"},
-    {"Name": "GSD Holding", "Symbol": "GSDHO.IS", "SnapshotPrice": 5.57, "SnapshotGainPct": 39.21, "SnapshotTarget": 7.768, "Rating": "Very Good"},
-    {"Name": "Lider Faktoring", "Symbol": "LIDFA.IS", "SnapshotPrice": 2.78, "SnapshotGainPct": 38.70, "SnapshotTarget": 3.856, "Rating": "Good"},
-    {"Name": "Bera Holding", "Symbol": "BERA.IS", "SnapshotPrice": 14.97, "SnapshotGainPct": 38.26, "SnapshotTarget": 20.684, "Rating": "Fair"},
-    {"Name": "Brisa", "Symbol": "BRISA.IS", "SnapshotPrice": 80.95, "SnapshotGainPct": 38.20, "SnapshotTarget": 111.87, "Rating": "Good"},
-    {"Name": "Kervan Gida", "Symbol": "KRVGD.IS", "SnapshotPrice": 2.76, "SnapshotGainPct": 37.78, "SnapshotTarget": 3.80, "Rating": "Good"},
-    {"Name": "TAV Airports", "Symbol": "TAVHL.IS", "SnapshotPrice": 263.75, "SnapshotGainPct": 36.94, "SnapshotTarget": 360.84, "Rating": "Good"},
-    {"Name": "Tofas Auto", "Symbol": "TOASO.IS", "SnapshotPrice": 298.75, "SnapshotGainPct": 36.51, "SnapshotTarget": 407.82, "Rating": "Good"},
-    {"Name": "Ulker Biskuvi", "Symbol": "ULKER.IS", "SnapshotPrice": np.nan, "SnapshotGainPct": np.nan, "SnapshotTarget": np.nan, "Rating": "User List"},
-]
-
-UNIVERSE_STOCKS: Dict[str, str] = {}
-for _category, _mapping in MARKET_DATA.items():
-    if _category == "Indices":
-        continue
-    UNIVERSE_STOCKS.update(_mapping)
-
-CAPITAL_GAIN_SYMBOL_TO_NAME = {row["Symbol"]: row["Name"] for row in CAPITAL_GAIN_LEADERS}
-ALL_ANALYSIS_SYMBOLS = sorted(set(UNIVERSE_STOCKS.values()).union(CAPITAL_GAIN_SYMBOL_TO_NAME.keys()))
-SYMBOL_TO_NAME = {v: k for k, m in MARKET_DATA.items() if k != "Indices" for v in []}
-for cat, mapping in MARKET_DATA.items():
-    if cat != "Indices":
-        for name, sym in mapping.items():
-            SYMBOL_TO_NAME[sym] = name
-for row in CAPITAL_GAIN_LEADERS:
-    SYMBOL_TO_NAME.setdefault(row["Symbol"], row["Name"])
-
-# -------------------------------------------------------------------------
-# INDICATOR FALLBACKS
-# -------------------------------------------------------------------------
-def _series(x, index=None):
-    return pd.Series(x, index=index).astype(float)
-
-
-def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False, min_periods=span).mean()
-
-
-def rsi(s: pd.Series, period: int = 14) -> pd.Series:
-    delta = s.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-
-
-def cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
-    tp = (high + low + close) / 3
-    sma = tp.rolling(period).mean()
-    mad = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    return (tp - sma) / (0.015 * mad.replace(0, np.nan))
-
-
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    # Wilder-style ADX approximation; TA-Lib used when available.
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
-    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
-    tr = atr(high, low, close, period)
-    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / tr.replace(0, np.nan)
-    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / tr.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-
-
-def macd_calc(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    m = ema(close, fast) - ema(close, slow)
-    sig = ema(m, signal)
-    return m, sig, m - sig
-
-
-def bbands(close: pd.Series, period: int = 20, ndev: float = 2.0):
-    mid = close.rolling(period).mean()
-    sd = close.rolling(period).std()
-    return mid + ndev * sd, mid, mid - ndev * sd
-
-# -------------------------------------------------------------------------
-# DATA FETCHING: REAL YAHOO DATA ONLY
-# -------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_data(symbol: str, start, end) -> Optional[pd.DataFrame]:
-    """Download OHLCV data from Yahoo Finance. Returns None if unavailable.
-
-    Data governance: no proxy, no interpolation, no synthetic fallback.
-    """
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
+def safe_float(value, default=np.nan) -> float:
     try:
-        download_start = pd.to_datetime(start) - pd.DateOffset(years=2)
-        df = yf.download(
-            symbol,
-            start=download_start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if df is None or df.empty:
-            return None
-        required_cols = ["Open", "High", "Low", "Close", "Volume"]
-        if not all(c in df.columns for c in required_cols):
-            return None
-        df = df[required_cols].copy()
-        df.index = pd.to_datetime(df.index).tz_localize(None) if getattr(df.index, "tz", None) is not None else pd.to_datetime(df.index)
-        df = df.loc[~df.index.duplicated(keep="last")].sort_index()
-        df = df.dropna(how="any")
-        df = df[(df["Close"] > 0) & (df["High"] >= df["Low"])]
-        return df if len(df) > 0 else None
+        out = float(value)
+        return out if np.isfinite(out) else default
     except Exception:
-        return None
+        return default
+
+
+def fmt_number(value: float, decimals: int = 2, suffix: str = "") -> str:
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return f"{value:,.{decimals}f}{suffix}"
+
+
+def render_dataframe(
+    frame: pd.DataFrame,
+    formats: Optional[Dict[str, str]] = None,
+    *,
+    hide_index: bool = True,
+) -> None:
+    """Render a numeric table without pandas Styler or matplotlib.
+
+    Streamlit column configuration preserves institutional number formatting while
+    avoiding pandas Styler and optional matplotlib styling paths.
+    """
+    clean = frame.copy().replace([np.inf, -np.inf], np.nan)
+    column_config = {}
+    for column, fmt in (formats or {}).items():
+        if column in clean.columns:
+            column_config[column] = st.column_config.NumberColumn(format=fmt)
+    st.dataframe(
+        clean,
+        width="stretch",
+        hide_index=hide_index,
+        column_config=column_config or None,
+    )
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def annualized_volatility(returns: pd.Series) -> float:
+    r = pd.Series(returns, dtype=float).dropna()
+    return float(r.std(ddof=1) * math.sqrt(TRADING_DAYS)) if len(r) > 1 else np.nan
+
+
+def max_drawdown(price: pd.Series) -> float:
+    p = pd.Series(price, dtype=float).dropna()
+    if p.empty:
+        return np.nan
+    return float((p / p.cummax() - 1.0).min())
+
+
+def compute_rsi(price: pd.Series, period: int = 14) -> pd.Series:
+    delta = price.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+
+def ewma_volatility(log_returns: pd.Series, lam: float = 0.94) -> pd.Series:
+    r = pd.Series(log_returns, dtype=float)
+    alpha = 1.0 - float(lam)
+    variance = r.pow(2).ewm(alpha=alpha, adjust=False, min_periods=20).mean()
+    return variance.pow(0.5) * math.sqrt(TRADING_DAYS)
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
-    c = close.values.astype(float)
-    h = high.values.astype(float)
-    l = low.values.astype(float)
-    v = volume.values.astype(float)
-
-    if TALIB_AVAILABLE:
-        df["RSI"] = ta.RSI(c, timeperiod=14)
-        df["EMA_20"] = ta.EMA(c, timeperiod=20)
-        df["EMA_50"] = ta.EMA(c, timeperiod=50)
-        df["EMA_100"] = ta.EMA(c, timeperiod=100)
-        df["EMA_200"] = ta.EMA(c, timeperiod=200)
-        df["CCI"] = ta.CCI(h, l, c, timeperiod=20)
-        df["ATR"] = ta.ATR(h, l, c, timeperiod=14)
-        df["ADX"] = ta.ADX(h, l, c, timeperiod=14)
-        macd, macd_signal, macd_hist = ta.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
-        upper, middle, lower = ta.BBANDS(c, timeperiod=20, nbdevup=2, nbdevdn=2)
-        df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = macd, macd_signal, macd_hist
-        df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"] = upper, middle, lower
-    else:
-        df["RSI"] = rsi(close, 14)
-        df["EMA_20"] = ema(close, 20)
-        df["EMA_50"] = ema(close, 50)
-        df["EMA_100"] = ema(close, 100)
-        df["EMA_200"] = ema(close, 200)
-        df["CCI"] = cci(high, low, close, 20)
-        df["ATR"] = atr(high, low, close, 14)
-        df["ADX"] = adx(high, low, close, 14)
-        m, sig, hist = macd_calc(close)
-        df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = m, sig, hist
-        up, mid, lo = bbands(close, 20, 2)
-        df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"] = up, mid, lo
-
-    df["Return"] = df["Close"].pct_change()
-    df["Log_Return"] = np.log(df["Close"] / df["Close"].shift(1))
-    df["Dollar_Volume"] = df["Close"] * df["Volume"]
-    df["Vol_20D_Ann"] = df["Return"].rolling(20).std() * np.sqrt(TRADING_DAYS)
-    df["Vol_63D_Ann"] = df["Return"].rolling(63).std() * np.sqrt(TRADING_DAYS)
-    df["Momentum_20D"] = df["Close"].pct_change(20)
-    df["Momentum_63D"] = df["Close"].pct_change(63)
-    df["Momentum_126D"] = df["Close"].pct_change(126)
-    df["Momentum_252D"] = df["Close"].pct_change(252)
-    df["High_252D"] = df["Close"].rolling(252).max()
-    df["Low_252D"] = df["Close"].rolling(252).min()
-    df["Pct_From_52W_High"] = df["Close"] / df["High_252D"] - 1
-    df["Pct_From_52W_Low"] = df["Close"] / df["Low_252D"] - 1
-    df["Drawdown"] = df["Close"] / df["Close"].cummax() - 1
-    df["ATR_Pct"] = df["ATR"] / df["Close"]
-    df = df.dropna(subset=["Close", "RSI", "EMA_50", "EMA_200", "ATR", "ADX", "MACD", "MACD_SIGNAL"])
-    return df
+    out = df.copy().sort_index()
+    out["Analysis Price"] = out["Adj Close"].where(out["Adj Close"].notna(), out["Close"])
+    price = out["Analysis Price"].astype(float)
+    out["Log Return"] = np.log(price / price.shift(1))
+    out["Simple Return"] = price.pct_change()
+    out["EMA 20"] = price.ewm(span=20, adjust=False, min_periods=20).mean()
+    out["EMA 50"] = price.ewm(span=50, adjust=False, min_periods=50).mean()
+    out["EMA 200"] = price.ewm(span=200, adjust=False, min_periods=200).mean()
+    out["BB Mid"] = price.rolling(20, min_periods=20).mean()
+    bb_std = price.rolling(20, min_periods=20).std(ddof=1)
+    out["BB Upper"] = out["BB Mid"] + 2.0 * bb_std
+    out["BB Lower"] = out["BB Mid"] - 2.0 * bb_std
+    out["ATR"] = compute_atr(out)
+    out["ATR %"] = out["ATR"] / price.replace(0.0, np.nan)
+    out["RSI"] = compute_rsi(price)
+    ema12 = price.ewm(span=12, adjust=False, min_periods=12).mean()
+    ema26 = price.ewm(span=26, adjust=False, min_periods=26).mean()
+    out["MACD"] = ema12 - ema26
+    out["MACD Signal"] = out["MACD"].ewm(span=9, adjust=False, min_periods=9).mean()
+    out["MACD Hist"] = out["MACD"] - out["MACD Signal"]
+    out["EWMA Vol 0.94"] = ewma_volatility(out["Log Return"], 0.94)
+    out["EWMA Vol 0.97"] = ewma_volatility(out["Log Return"], 0.97)
+    out["Rolling Vol 20"] = out["Log Return"].rolling(20, min_periods=20).std(ddof=1) * math.sqrt(TRADING_DAYS)
+    out["Rolling Vol 60"] = out["Log Return"].rolling(60, min_periods=40).std(ddof=1) * math.sqrt(TRADING_DAYS)
+    out["Rolling Vol 252"] = out["Log Return"].rolling(252, min_periods=126).std(ddof=1) * math.sqrt(TRADING_DAYS)
+    out["Momentum 5"] = np.log(price / price.shift(5))
+    out["Momentum 20"] = np.log(price / price.shift(20))
+    out["Momentum 60"] = np.log(price / price.shift(60))
+    out["Return Difference"] = out["Log Return"].diff()
+    return out
 
 
-def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
-    """Robust Supertrend implementation.
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_one_ticker(ticker: str, start_date: str, end_date: str) -> Tuple[pd.DataFrame, str]:
+    try:
+        raw = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as exc:
+        return pd.DataFrame(), f"{type(exc).__name__}: {exc}"
 
-    Critical fix versus the previous version:
-    - final upper/lower bands are explicitly initialized at the first valid ATR row.
-    - trend can flip both ways after initialization.
-    - the line does not remain NaN after the warm-up window.
+    if raw is None or raw.empty:
+        return pd.DataFrame(), "Yahoo Finance returned no observations."
 
-    trend = 1 means bullish; trend = -1 means bearish; trend = 0 means warm-up.
-    """
-    if df is None or df.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [c[0] for c in raw.columns]
 
+    raw = raw.copy()
+    raw.index = pd.to_datetime(raw.index)
+    if getattr(raw.index, "tz", None) is not None:
+        raw.index = raw.index.tz_localize(None)
+    raw = raw[~raw.index.duplicated(keep="last")].sort_index()
+
+    required = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+    for col in required:
+        if col not in raw.columns:
+            raw[col] = np.nan
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+    raw = raw[required].dropna(subset=["Close"])
+    if raw.empty:
+        return pd.DataFrame(), "No valid closing-price observations."
+    return raw, ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_universe(start_date: str, end_date: str) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
+    data: Dict[str, pd.DataFrame] = {}
+    records: List[Dict[str, object]] = []
+    for name, meta in INSTRUMENTS.items():
+        ticker = meta["ticker"]
+        raw, error = download_one_ticker(ticker, start_date, end_date)
+        if not raw.empty:
+            enriched = compute_indicators(raw)
+            data[ticker] = enriched
+            records.append(
+                {
+                    "Instrument": name,
+                    "Ticker": ticker,
+                    "Status": "OK",
+                    "First Date": enriched.index.min().date(),
+                    "Last Date": enriched.index.max().date(),
+                    "Observations": int(len(enriched)),
+                    "Missing Close": int(enriched["Close"].isna().sum()),
+                    "Missing Adj Close": int(enriched["Adj Close"].isna().sum()),
+                    "Error": "",
+                }
+            )
+        else:
+            records.append(
+                {
+                    "Instrument": name,
+                    "Ticker": ticker,
+                    "Status": "FAILED",
+                    "First Date": None,
+                    "Last Date": None,
+                    "Observations": 0,
+                    "Missing Close": None,
+                    "Missing Adj Close": None,
+                    "Error": error,
+                }
+            )
+    return data, pd.DataFrame(records)
+
+
+def common_log_returns(data: Dict[str, pd.DataFrame], tickers: List[str]) -> pd.DataFrame:
+    cols = []
+    for ticker in tickers:
+        if ticker in data:
+            s = data[ticker]["Log Return"].rename(ticker)
+            cols.append(s)
+    if not cols:
+        return pd.DataFrame()
+    return pd.concat(cols, axis=1, join="inner").dropna(how="any")
+
+
+def yield_bp_change(tnx_df: pd.DataFrame) -> pd.Series:
+    # Yahoo ^TNX is reported in percentage points (e.g. 4.57%).
+    # A 0.01 percentage-point move equals one basis point.
+    return tnx_df["Analysis Price"].astype(float).diff() * 100.0
+
+
+def rolling_relationship(asset_return: pd.Series, dxy_return: pd.Series, window: int) -> pd.DataFrame:
+    pair = pd.concat([asset_return.rename("Asset"), dxy_return.rename("DXY")], axis=1, join="inner").dropna()
+    corr = pair["Asset"].rolling(window, min_periods=max(20, window // 2)).corr(pair["DXY"])
+    cov = pair["Asset"].rolling(window, min_periods=max(20, window // 2)).cov(pair["DXY"])
+    var = pair["DXY"].rolling(window, min_periods=max(20, window // 2)).var()
+    beta = cov / var.replace(0.0, np.nan)
+    alpha_daily = pair["Asset"].rolling(window, min_periods=max(20, window // 2)).mean() - beta * pair["DXY"].rolling(window, min_periods=max(20, window // 2)).mean()
+    return pd.DataFrame({f"Corr {window}": corr, f"Beta {window}": beta, f"Alpha Ann {window}": alpha_daily * TRADING_DAYS, f"R2 {window}": corr.pow(2)})
+
+
+def ewma_correlation(asset_return: pd.Series, dxy_return: pd.Series, span: int = 60) -> pd.Series:
+    pair = pd.concat([asset_return.rename("Asset"), dxy_return.rename("DXY")], axis=1, join="inner").dropna()
+    cov = pair["Asset"].ewm(span=span, adjust=False, min_periods=30).cov(pair["DXY"])
+    var_a = pair["Asset"].ewm(span=span, adjust=False, min_periods=30).var()
+    var_d = pair["DXY"].ewm(span=span, adjust=False, min_periods=30).var()
+    return cov / np.sqrt(var_a * var_d).replace(0.0, np.nan)
+
+
+def lead_lag_correlations(asset_return: pd.Series, dxy_return: pd.Series, max_lag: int = 20) -> pd.DataFrame:
+    pair = pd.concat([asset_return.rename("Asset"), dxy_return.rename("DXY")], axis=1, join="inner").dropna()
+    rows = []
+    for lag in range(-max_lag, max_lag + 1):
+        # Positive lag: today's DXY return versus commodity return lag days ahead.
+        corr = pair["DXY"].corr(pair["Asset"].shift(-lag))
+        rows.append({"Lag": lag, "Correlation": corr})
+    return pd.DataFrame(rows)
+
+
+def regression_scenarios(asset_df: pd.DataFrame, dxy_df: pd.DataFrame, tnx_df: pd.DataFrame, window: int = 504) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    frame = pd.concat(
+        [
+            asset_df["Log Return"].rename("Asset"),
+            dxy_df["Log Return"].rename("DXY"),
+            yield_bp_change(tnx_df).rename("TNX_bp"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    frame = frame.tail(window)
+    if len(frame) < 120:
+        return pd.DataFrame(), {}
+    frame["Interaction"] = frame["DXY"] * frame["TNX_bp"]
+    X = np.ascontiguousarray(frame[["DXY", "TNX_bp", "Interaction"]].to_numpy(dtype=np.float64, copy=True))
+    y = np.ascontiguousarray(frame["Asset"].to_numpy(dtype=np.float64, copy=True))
+    with threadpool_limits(limits=1):
+        model = LinearRegression(n_jobs=1).fit(X, y)
+        fitted = model.predict(X)
+        r2 = float(model.score(X, y))
+    resid_std = float(np.std(y - fitted, ddof=1))
+    scenarios = [
+        ("DXY +1%", 0.01, 0.0),
+        ("DXY -1%", -0.01, 0.0),
+        ("DXY +2%", 0.02, 0.0),
+        ("DXY -2%", -0.02, 0.0),
+        ("DXY +1% / UST10Y +10bp", 0.01, 10.0),
+        ("DXY -1% / UST10Y -10bp", -0.01, -10.0),
+        ("DXY +1% / UST10Y -10bp", 0.01, -10.0),
+        ("DXY -1% / UST10Y +10bp", -0.01, 10.0),
+    ]
+    rows = []
+    for label, dxy_shock, bp_shock in scenarios:
+        x = np.array([[dxy_shock, bp_shock, dxy_shock * bp_shock]])
+        pred = float(model.predict(x)[0])
+        rows.append(
+            {
+                "Scenario": label,
+                "Expected Log Return %": pred * 100.0,
+                "Approx. Simple Return %": (math.exp(pred) - 1.0) * 100.0,
+                "Lower 95% %": (pred - 1.96 * resid_std) * 100.0,
+                "Upper 95% %": (pred + 1.96 * resid_std) * 100.0,
+            }
+        )
+    stats = {
+        "Intercept": float(model.intercept_),
+        "DXY Beta": float(model.coef_[0]),
+        "TNX bp Beta": float(model.coef_[1]),
+        "Interaction Beta": float(model.coef_[2]),
+        "R2": r2,
+        "Residual Std": resid_std,
+        "Observations": int(len(frame)),
+    }
+    return pd.DataFrame(rows), stats
+
+
+def trend_channel(price: pd.Series, lookback: int = 90) -> pd.DataFrame:
+    p = pd.Series(price, dtype=float).dropna()
+    out = pd.DataFrame(index=price.index, columns=["Mid", "Upper", "Lower"], dtype=float)
+    if len(p) < 20:
+        return out
+    p = p.tail(min(lookback, len(p)))
+    x = np.arange(len(p), dtype=float)
+    slope, intercept = np.polyfit(x, p.values, 1)
+    fitted = intercept + slope * x
+    residual_std = float(np.std(p.values - fitted, ddof=1))
+    out.loc[p.index, "Mid"] = fitted
+    out.loc[p.index, "Upper"] = fitted + 1.5 * residual_std
+    out.loc[p.index, "Lower"] = fitted - 1.5 * residual_std
+    return out
+
+
+def anchored_vwap(df: pd.DataFrame, lookback: int = 150) -> Tuple[pd.Series, Optional[pd.Timestamp]]:
+    low = df["Low"].astype(float)
+    swing_low = (low.shift(2) > low.shift(1)) & (low.shift(1) > low) & (low.shift(-1) > low) & (low.shift(-2) > low)
+    recent = df.tail(min(lookback, len(df)))
+    candidates = recent.index[swing_low.reindex(recent.index).fillna(False)]
+    anchor = candidates[-1] if len(candidates) else recent.index[0]
+    mask = df.index >= anchor
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    volume = df["Volume"].astype(float)
+    result = pd.Series(np.nan, index=df.index, dtype=float)
+    result.loc[mask] = (typical[mask] * volume[mask]).cumsum() / volume[mask].cumsum().replace(0.0, np.nan)
+    return result, anchor
+
+
+def swing_points(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
-
-    if TALIB_AVAILABLE:
-        atr_series = pd.Series(
-            ta.ATR(high.values, low.values, close.values, timeperiod=period),
-            index=df.index,
-            dtype=float,
-        )
-    else:
-        atr_series = atr(high, low, close, period)
-
-    hl2 = (high + low) / 2.0
-    basic_ub = hl2 + multiplier * atr_series
-    basic_lb = hl2 - multiplier * atr_series
-
-    final_ub = pd.Series(np.nan, index=df.index, dtype=float)
-    final_lb = pd.Series(np.nan, index=df.index, dtype=float)
-    trend = pd.Series(0, index=df.index, dtype=int)
-    st_line = pd.Series(np.nan, index=df.index, dtype=float)
-
-    first_valid = atr_series.first_valid_index()
-    if first_valid is None:
-        return st_line, trend
-
-    start_pos = df.index.get_loc(first_valid)
-
-    for i in range(start_pos, len(df)):
-        if pd.isna(basic_ub.iloc[i]) or pd.isna(basic_lb.iloc[i]):
-            continue
-
-        if i == start_pos or pd.isna(final_ub.iloc[i - 1]) or pd.isna(final_lb.iloc[i - 1]):
-            final_ub.iloc[i] = basic_ub.iloc[i]
-            final_lb.iloc[i] = basic_lb.iloc[i]
-            trend.iloc[i] = 1
-            st_line.iloc[i] = final_lb.iloc[i]
-            continue
-
-        prev_final_ub = final_ub.iloc[i - 1]
-        prev_final_lb = final_lb.iloc[i - 1]
-        prev_close = close.iloc[i - 1]
-
-        if (basic_ub.iloc[i] < prev_final_ub) or (prev_close > prev_final_ub):
-            final_ub.iloc[i] = basic_ub.iloc[i]
-        else:
-            final_ub.iloc[i] = prev_final_ub
-
-        if (basic_lb.iloc[i] > prev_final_lb) or (prev_close < prev_final_lb):
-            final_lb.iloc[i] = basic_lb.iloc[i]
-        else:
-            final_lb.iloc[i] = prev_final_lb
-
-        prev_trend = trend.iloc[i - 1] if trend.iloc[i - 1] in (1, -1) else 1
-
-        if prev_trend == 1 and close.iloc[i] < final_lb.iloc[i]:
-            trend.iloc[i] = -1
-        elif prev_trend == -1 and close.iloc[i] > final_ub.iloc[i]:
-            trend.iloc[i] = 1
-        else:
-            trend.iloc[i] = prev_trend
-
-        st_line.iloc[i] = final_lb.iloc[i] if trend.iloc[i] == 1 else final_ub.iloc[i]
-
-    return st_line, trend
-
-
-# -------------------------------------------------------------------------
-# RISK METRICS
-# -------------------------------------------------------------------------
-def max_drawdown(equity: pd.Series) -> float:
-    eq = pd.Series(equity).dropna()
-    if eq.empty:
-        return np.nan
-    return float((eq / eq.cummax() - 1).min())
-
-
-def safe_cagr(ret: pd.Series) -> float:
-    r = pd.Series(ret).dropna()
-    if r.empty:
-        return np.nan
-    total = (1 + r).prod() - 1
-    years = len(r) / TRADING_DAYS
-    if years <= 0 or 1 + total <= 0:
-        return np.nan
-    return float((1 + total) ** (1 / years) - 1)
-
-
-def tail_risk(r: pd.Series, alpha: float = 0.95):
-    x = pd.Series(r).dropna()
-    if len(x) < 20:
-        return np.nan, np.nan
-    var = -np.quantile(x, 1 - alpha)
-    cvar = -x[x <= np.quantile(x, 1 - alpha)].mean()
-    return float(var), float(cvar)
-
-
-def compute_return_metrics(ret: pd.Series, benchmark_ret: Optional[pd.Series] = None, name: str = "Series") -> Dict[str, float]:
-    r = pd.Series(ret).dropna().astype(float)
-    if r.empty:
-        return {"Name": name}
-    eq = (1 + r).cumprod()
-    cagr = safe_cagr(r)
-    vol = float(r.std() * np.sqrt(TRADING_DAYS)) if r.std() > 0 else np.nan
-    downside = r[r < 0].std() * np.sqrt(TRADING_DAYS) if (r < 0).sum() > 2 else np.nan
-    sharpe = cagr / vol if vol and vol > 0 else np.nan
-    sortino = cagr / downside if downside and downside > 0 else np.nan
-    mdd = max_drawdown(eq)
-    calmar = cagr / abs(mdd) if mdd and mdd < 0 else np.nan
-    dd_series = eq / eq.cummax() - 1.0
-    ulcer = float(np.sqrt(np.mean(np.square(dd_series * 100)))) if len(dd_series) else np.nan
-    gains = float(r[r > 0].sum())
-    losses_abs = float(abs(r[r < 0].sum()))
-    omega = gains / losses_abs if losses_abs > 0 else np.nan
-    recovery_days = 0
-    longest_recovery_days = 0
-    for underwater in (dd_series < 0):
-        recovery_days = recovery_days + 1 if underwater else 0
-        longest_recovery_days = max(longest_recovery_days, recovery_days)
-    var95, cvar95 = tail_risk(r, 0.95)
-    var99, cvar99 = tail_risk(r, 0.99)
-
-    beta = alpha = tracking_error = info_ratio = corr = np.nan
-    if benchmark_ret is not None:
-        b = pd.Series(benchmark_ret).reindex(r.index).dropna()
-        common = r.index.intersection(b.index)
-        rr, bb = r.reindex(common).dropna(), b.reindex(common).dropna()
-        common = rr.index.intersection(bb.index)
-        rr, bb = rr.reindex(common), bb.reindex(common)
-        if len(rr) > 20 and bb.var() > 0:
-            beta = float(np.cov(rr, bb, ddof=1)[0, 1] / np.var(bb, ddof=1))
-            alpha = float((rr.mean() - beta * bb.mean()) * TRADING_DAYS)
-            active = rr - bb
-            tracking_error = float(active.std() * np.sqrt(TRADING_DAYS))
-            info_ratio = float(active.mean() * TRADING_DAYS / tracking_error) if tracking_error > 0 else np.nan
-            corr = float(rr.corr(bb))
-
-    return {
-        "Name": name,
-        "Total Return %": ((1 + r).prod() - 1) * 100,
-        "CAGR %": cagr * 100 if pd.notna(cagr) else np.nan,
-        "Ann Vol %": vol * 100 if pd.notna(vol) else np.nan,
-        "Sharpe": sharpe,
-        "Sortino": sortino,
-        "Calmar": calmar,
-        "Omega": omega,
-        "Ulcer Index": ulcer,
-        "Longest Drawdown Days": int(longest_recovery_days),
-        "Max Drawdown %": mdd * 100 if pd.notna(mdd) else np.nan,
-        "VaR 95% %": var95 * 100 if pd.notna(var95) else np.nan,
-        "CVaR 95% %": cvar95 * 100 if pd.notna(cvar95) else np.nan,
-        "VaR 99% %": var99 * 100 if pd.notna(var99) else np.nan,
-        "CVaR 99% %": cvar99 * 100 if pd.notna(cvar99) else np.nan,
-        "Beta vs XU100": beta,
-        "Alpha Ann %": alpha * 100 if pd.notna(alpha) else np.nan,
-        "Tracking Error %": tracking_error * 100 if pd.notna(tracking_error) else np.nan,
-        "Information Ratio": info_ratio,
-        "Correlation vs XU100": corr,
-    }
-
-
-def compute_stats(df: pd.DataFrame, trades: list, index_returns: Optional[pd.Series] = None):
-    df = df.copy()
-    df["BH_Equity"] = (1 + df["Return"].fillna(0)).cumprod()
-    df["Strategy_Equity"] = (1 + df["Strategy_Return"].fillna(0)).cumprod()
-    bh = compute_return_metrics(df["Return"], index_returns, name="Buy & Hold")
-    stg = compute_return_metrics(df["Strategy_Return"], index_returns, name="Strategy")
-
-    trades_df = pd.DataFrame(trades)
-    if not trades_df.empty:
-        wins = trades_df[trades_df["Return"] > 0]
-        losses = trades_df[trades_df["Return"] <= 0]
-        gross_profit = wins["Return"].sum()
-        gross_loss = losses["Return"].sum()
-        trade_stats = {
-            "trade_count": len(trades_df),
-            "win_rate": len(wins) / len(trades_df) * 100,
-            "avg_trade": trades_df["Return"].mean() * 100,
-            "avg_win": wins["Return"].mean() * 100 if not wins.empty else np.nan,
-            "avg_loss": losses["Return"].mean() * 100 if not losses.empty else np.nan,
-            "profit_factor": gross_profit / abs(gross_loss) if gross_loss < 0 else np.nan,
-            "avg_hold": trades_df["HoldingDays"].mean(),
-        }
-    else:
-        trade_stats = {"trade_count": 0, "win_rate": 0.0, "avg_trade": 0.0, "avg_win": np.nan, "avg_loss": np.nan, "profit_factor": np.nan, "avg_hold": np.nan}
-
-    pos_mask = df["Return"] > 0
-    neg_mask = df["Return"] < 0
-    up_capture = (df.loc[pos_mask, "Strategy_Return"].sum() / df.loc[pos_mask, "Return"].sum() * 100) if pos_mask.any() and df.loc[pos_mask, "Return"].sum() != 0 else np.nan
-    down_capture = (df.loc[neg_mask, "Strategy_Return"].sum() / df.loc[neg_mask, "Return"].sum() * 100) if neg_mask.any() and df.loc[neg_mask, "Return"].sum() != 0 else np.nan
-    directional = ((np.sign(df["Return"]) == np.sign(df["Strategy_Return"])).mean() * 100) if len(df) else np.nan
-
-    stats = {
-        "bh_total_pct": bh.get("Total Return %", np.nan),
-        "strat_total_pct": stg.get("Total Return %", np.nan),
-        "bh_annual_pct": bh.get("CAGR %", np.nan),
-        "strat_annual_pct": stg.get("CAGR %", np.nan),
-        "bh_mdd_pct": bh.get("Max Drawdown %", np.nan),
-        "strat_mdd_pct": stg.get("Max Drawdown %", np.nan),
-        "sharpe": stg.get("Sharpe", np.nan),
-        "sortino": stg.get("Sortino", np.nan),
-        "calmar": stg.get("Calmar", np.nan),
-        "omega": stg.get("Omega", np.nan),
-        "ulcer_index": stg.get("Ulcer Index", np.nan),
-        "longest_dd_days": stg.get("Longest Drawdown Days", np.nan),
-        "var95_pct": stg.get("VaR 95% %", np.nan),
-        "cvar95_pct": stg.get("CVaR 95% %", np.nan),
-        "var99_pct": stg.get("VaR 99% %", np.nan),
-        "cvar99_pct": stg.get("CVaR 99% %", np.nan),
-        "beta_asset": bh.get("Beta vs XU100", np.nan),
-        "beta_strategy": stg.get("Beta vs XU100", np.nan),
-        "alpha_strategy_pct": stg.get("Alpha Ann %", np.nan),
-        "tracking_error_pct": stg.get("Tracking Error %", np.nan),
-        "information_ratio": stg.get("Information Ratio", np.nan),
-        "up_capture_pct": up_capture,
-        "down_capture_pct": down_capture,
-        "directional_match_pct": directional,
-        "corr_bh": df["BH_Equity"].corr(df["Strategy_Equity"]),
-        "exposure_pct": float(df.get("Position", pd.Series(0, index=df.index)).mean() * 100) if len(df) else np.nan,
-        "buy_signal_count": int((df.get("Signal", pd.Series(0, index=df.index)) == 1).sum()),
-        "sell_signal_count": int((df.get("Signal", pd.Series(0, index=df.index)) == -1).sum()),
-        "entry_eligible_days": int(df.get("Entry_Eligible", pd.Series(False, index=df.index)).sum()) if len(df) else 0,
-        "active_position_now": bool(df.get("Position", pd.Series(0, index=df.index)).iloc[-1] == 1) if len(df) else False,
-    }
-    stats.update(trade_stats)
-    return trades_df, stats
-
-
-def add_rolling_beta(df: pd.DataFrame, index_returns: Optional[pd.Series]) -> pd.DataFrame:
-    df = df.copy()
-    if index_returns is None or len(index_returns) == 0:
-        df["Rolling_Beta_Asset"] = np.nan
-        df["Rolling_Beta_Strategy"] = np.nan
-        return df
-    pair = pd.DataFrame({
-        "asset": df["Return"],
-        "strategy": df["Strategy_Return"],
-        "index": index_returns.reindex(df.index),
-    }).dropna()
-    if len(pair) >= ROLLING_BETA_WINDOW:
-        roll_var = pair["index"].rolling(ROLLING_BETA_WINDOW).var()
-        df["Rolling_Beta_Asset"] = (pair["asset"].rolling(ROLLING_BETA_WINDOW).cov(pair["index"]) / roll_var).reindex(df.index).ffill()
-        df["Rolling_Beta_Strategy"] = (pair["strategy"].rolling(ROLLING_BETA_WINDOW).cov(pair["index"]) / roll_var).reindex(df.index).ffill()
-    else:
-        df["Rolling_Beta_Asset"] = np.nan
-        df["Rolling_Beta_Strategy"] = np.nan
-    return df
-
-# -------------------------------------------------------------------------
-# BACKTESTS
-# -------------------------------------------------------------------------
-def backtest_macd_atr_trailing(
-    df: pd.DataFrame,
-    start_date,
-    atr_mult_stop: float = 2.0,
-    use_rsi_exit: bool = False,
-    rsi_exit_level: float = 30.0,
-    use_ema_filter: bool = False,
-    use_adx_filter: bool = False,
-    adx_threshold: float = 10.0,
-    use_macd_exit: bool = False,
-    fastperiod: int = 8,
-    slowperiod: int = 21,
-    signalperiod: int = 9,
-    market_filter=None,
-    index_returns: Optional[pd.Series] = None,
-    transaction_cost_bps: float = 8.0,
-    slippage_bps: float = 4.0,
-):
-    df = df.copy()
-    df = df[df.index >= pd.Timestamp(start_date)].copy()
-    if df.empty:
-        return df, pd.DataFrame(), {}
-
-    m, sig, hist = macd_calc(df["Close"], fastperiod, slowperiod, signalperiod)
-    if TALIB_AVAILABLE:
-        m0, s0, h0 = ta.MACD(df["Close"].values, fastperiod=fastperiod, slowperiod=slowperiod, signalperiod=signalperiod)
-        m, sig, hist = pd.Series(m0, index=df.index), pd.Series(s0, index=df.index), pd.Series(h0, index=df.index)
-    df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = m, sig, hist
-
-    bull_cross = (df["MACD"] > df["MACD_SIGNAL"]) & (df["MACD"].shift(1) <= df["MACD_SIGNAL"].shift(1))
-    bear_cross = (df["MACD"] < df["MACD_SIGNAL"]) & (df["MACD"].shift(1) >= df["MACD_SIGNAL"].shift(1))
-
-    # FIX: do not require a fresh crossover after the selected backtest start date.
-    # If the backtest starts while MACD is already bullish, the strategy may enter.
-    # Otherwise many valid histories appear as if the strategy never worked.
-    df["Filter_Trend_Pass"] = (df["MACD"] > df["MACD_SIGNAL"]).fillna(False)
-    df["Filter_EMA200_Pass"] = ((df["Close"] > df["EMA_200"]).fillna(False) if use_ema_filter else True)
-    df["Filter_ADX_Pass"] = ((df["ADX"] > adx_threshold).fillna(False) if use_adx_filter else True)
-    if market_filter is not None:
-        df["Filter_Market_Pass"] = market_filter.reindex(df.index).ffill().fillna(False)
-    else:
-        df["Filter_Market_Pass"] = True
-    entry_state = (
-        df["Filter_Trend_Pass"]
-        & df["Filter_EMA200_Pass"]
-        & df["Filter_ADX_Pass"]
-        & df["Filter_Market_Pass"]
-    )
-    entry_long = entry_state
-
-    exit_rule = pd.Series(False, index=df.index)
-    if use_macd_exit:
-        exit_rule |= bear_cross.fillna(False)
-    if use_rsi_exit:
-        exit_rule |= (df["RSI"] < rsi_exit_level).fillna(False)
-
-    return _run_trailing_backtest(df, entry_long, exit_rule, atr_mult_stop, "MACD/RSI_EXIT", index_returns, transaction_cost_bps, slippage_bps)
-
-
-def backtest_supertrend_trailing(
-    df: pd.DataFrame,
-    start_date,
-    st_period: int = 10,
-    st_mult: float = 2.5,
-    use_adx_filter: bool = False,
-    adx_threshold: float = 10.0,
-    use_ema_filter: bool = False,
-    atr_mult_stop: float = 2.0,
-    market_filter=None,
-    index_returns: Optional[pd.Series] = None,
-    transaction_cost_bps: float = 8.0,
-    slippage_bps: float = 4.0,
-):
-    df = df.copy()
-    st_line, st_dir = compute_supertrend(df, st_period, st_mult)
-    df["ST_Line"] = st_line
-    df["ST_Dir"] = st_dir
-    df = df[df.index >= pd.Timestamp(start_date)].copy()
-    if df.empty:
-        return df, pd.DataFrame(), {}
-    df["ST_Dir_prev"] = df["ST_Dir"].shift(1).fillna(0)
-
-    # FIX: state-based entry instead of flip-only entry.
-    # The previous version waited only for ST_Dir to flip from non-bullish to bullish.
-    # If the chosen start date occurred during an already bullish regime, Strategy_Return
-    # stayed flat and the Backtest & Risk tab looked broken.
-    df["Filter_Trend_Pass"] = (df["ST_Dir"] == 1).fillna(False)
-    df["Filter_EMA200_Pass"] = ((df["Close"] > df["EMA_200"]).fillna(False) if use_ema_filter else True)
-    df["Filter_ADX_Pass"] = ((df["ADX"] > adx_threshold).fillna(False) if use_adx_filter else True)
-    if market_filter is not None:
-        df["Filter_Market_Pass"] = market_filter.reindex(df.index).ffill().fillna(False)
-    else:
-        df["Filter_Market_Pass"] = True
-    entry_state = (
-        df["Filter_Trend_Pass"]
-        & df["Filter_EMA200_Pass"]
-        & df["Filter_ADX_Pass"]
-        & df["Filter_Market_Pass"]
-    )
-    entry_long = entry_state
-
-    exit_rule = ((df["ST_Dir"] == -1) & (df["ST_Dir_prev"] == 1)).fillna(False)
-    return _run_trailing_backtest(df, entry_long.fillna(False), exit_rule, atr_mult_stop, "SUPERTREND_FLIP", index_returns, transaction_cost_bps, slippage_bps)
-
-
-def _run_trailing_backtest(df: pd.DataFrame, entry_long: pd.Series, exit_rule: pd.Series, atr_mult_stop: float, exit_label: str, index_returns: Optional[pd.Series], transaction_cost_bps: float = 8.0, slippage_bps: float = 4.0):
-    df = df.copy()
-    entry_long = pd.Series(entry_long, index=df.index).reindex(df.index).fillna(False).astype(bool)
-    exit_rule = pd.Series(exit_rule, index=df.index).reindex(df.index).fillna(False).astype(bool)
-
-    position = 0
-    signals, positions, atr_stops = [], [], []
-    entry_price = None
-    entry_index = None
-    peak_price = None
-    stop_level = np.nan
-    trades = []
-
-    for i, (idx, row) in enumerate(df.iterrows()):
-        price = float(row["Close"])
-        atr_value = float(row["ATR"])
-        buy = bool(entry_long.iloc[i])
-        exit_today = bool(exit_rule.iloc[i])
-        hit_stop = False
-
-        if position == 1:
-            peak_price = max(peak_price if peak_price is not None else price, price)
-            new_stop = peak_price - atr_mult_stop * atr_value
-            stop_level = new_stop if np.isnan(stop_level) else max(stop_level, new_stop)
-            hit_stop = price <= stop_level
-
-        if position == 0:
-            if buy:
-                position = 1
-                entry_price = price
-                entry_index = idx
-                peak_price = price
-                stop_level = price - atr_mult_stop * atr_value
-                signal = 1
-            else:
-                signal = 0
-        else:
-            reason = "ATR_TRAILING_STOP" if hit_stop else (exit_label if exit_today else None)
-            if reason is not None:
-                position = 0
-                signal = -1
-                ret = price / entry_price - 1.0 if entry_price else np.nan
-                trades.append({
-                    "EntryDate": entry_index,
-                    "ExitDate": idx,
-                    "EntryPrice": entry_price,
-                    "ExitPrice": price,
-                    "Return": ret,
-                    "ReturnPct": ret * 100,
-                    "HoldingDays": (idx - entry_index).days if entry_index is not None else np.nan,
-                    "ExitReason": reason,
-                })
-                entry_price = None
-                entry_index = None
-                peak_price = None
-                stop_level = np.nan
-            else:
-                signal = 0
-
-        signals.append(signal)
-        positions.append(position)
-        atr_stops.append(stop_level if position == 1 else np.nan)
-
-    df["Signal"] = signals
-    df["Position"] = positions
-    df["ATR_Stop"] = atr_stops
-    df["Entry_Eligible"] = entry_long
-    df["Exit_Rule"] = exit_rule
-    df["Days_In_Market"] = df["Position"].expanding().sum()
-    df["Return"] = df["Close"].pct_change().fillna(0.0)
-    df["Gross_Strategy_Return"] = df["Position"].shift(1).fillna(0) * df["Return"]
-    turnover = df["Position"].diff().abs().fillna(df["Position"].abs())
-    one_way_cost = (float(transaction_cost_bps) + float(slippage_bps)) / 10000.0
-    df["Trading_Cost"] = turnover * one_way_cost
-    df["Strategy_Return"] = df["Gross_Strategy_Return"] - df["Trading_Cost"]
-    df["Turnover"] = turnover
-    df["BH_Equity"] = (1 + df["Return"]).cumprod()
-    df["Strategy_Equity"] = (1 + df["Strategy_Return"]).cumprod()
-    df["Strategy_Drawdown"] = df["Strategy_Equity"] / df["Strategy_Equity"].cummax() - 1
-    df = add_rolling_beta(df, index_returns)
-    trades_df, stats = compute_stats(df, trades, index_returns=index_returns)
-    return df, trades_df, stats
-
-# -------------------------------------------------------------------------
-# SCREENER HELPERS
-# -------------------------------------------------------------------------
-def technical_grade(last: pd.Series) -> Tuple[float, str]:
-    score = 0.0
-    reasons = []
-    if last["Close"] > last["EMA_200"]:
-        score += 20; reasons.append("Price>EMA200")
-    if last["EMA_50"] > last["EMA_200"]:
-        score += 15; reasons.append("EMA50>EMA200")
-    if last["MACD"] > last["MACD_SIGNAL"]:
-        score += 12; reasons.append("MACD+")
-    if 45 <= last["RSI"] <= 70:
-        score += 15; reasons.append("Healthy RSI")
-    elif last["RSI"] > 70:
-        score += 5; reasons.append("Overbought RSI")
-    if last["ADX"] >= 20:
-        score += 12; reasons.append("Trend ADX")
-    if pd.notna(last.get("Momentum_63D", np.nan)) and last["Momentum_63D"] > 0:
-        score += 10; reasons.append("3M Momentum+")
-    if pd.notna(last.get("Momentum_126D", np.nan)) and last["Momentum_126D"] > 0:
-        score += 8; reasons.append("6M Momentum+")
-    if pd.notna(last.get("Pct_From_52W_High", np.nan)) and last["Pct_From_52W_High"] > -0.15:
-        score += 8; reasons.append("Near 52W high")
-    return min(score, 100.0), ", ".join(reasons)
-
-
-def analyze_symbol(symbol: str, name: str, start_date, end_date, index_returns: Optional[pd.Series], min_obs: int = MIN_PRICE_OBS):
-    raw = get_data(symbol, start_date, end_date)
-    if raw is None or len(raw) < min_obs:
-        return None, {"Name": name, "Symbol": symbol, "Status": "Excluded", "Reason": f"Insufficient Yahoo data (<{min_obs} rows)"}
-    ind = compute_indicators(raw)
-    if len(ind) < min_obs:
-        return None, {"Name": name, "Symbol": symbol, "Status": "Excluded", "Reason": "Insufficient indicator-ready rows"}
-    last = ind.iloc[-1]
-    returns = ind["Return"].dropna()
-    bench = index_returns.reindex(returns.index).dropna() if index_returns is not None else None
-    metrics = compute_return_metrics(returns, bench, name=name)
-    tech_score, reasons = technical_grade(last)
-
-    row = {
-        "Name": name,
-        "Symbol": symbol,
-        "Last Close": last["Close"],
-        "RSI": last["RSI"],
-        "ADX": last["ADX"],
-        "ATR %": last["ATR_Pct"] * 100,
-        "20D Momentum %": last.get("Momentum_20D", np.nan) * 100,
-        "3M Momentum %": last.get("Momentum_63D", np.nan) * 100,
-        "6M Momentum %": last.get("Momentum_126D", np.nan) * 100,
-        "1Y Momentum %": last.get("Momentum_252D", np.nan) * 100,
-        "From 52W High %": last.get("Pct_From_52W_High", np.nan) * 100,
-        "From 52W Low %": last.get("Pct_From_52W_Low", np.nan) * 100,
-        "Ann Vol %": metrics.get("Ann Vol %", np.nan),
-        "CAGR %": metrics.get("CAGR %", np.nan),
-        "Max Drawdown %": metrics.get("Max Drawdown %", np.nan),
-        "Sharpe": metrics.get("Sharpe", np.nan),
-        "Sortino": metrics.get("Sortino", np.nan),
-        "Calmar": metrics.get("Calmar", np.nan),
-        "Beta vs XU100": metrics.get("Beta vs XU100", np.nan),
-        "VaR 95% %": metrics.get("VaR 95% %", np.nan),
-        "CVaR 95% %": metrics.get("CVaR 95% %", np.nan),
-        "Avg Daily TL Volume": ind["Dollar_Volume"].tail(60).mean(),
-        "Technical Score": tech_score,
-        "Signal Drivers": reasons,
-        "Status": "OK",
-        "Reason": "",
-    }
-    return ind, row
-
-
-def run_universe_scan(name_to_symbol: Dict[str, str], start_date, end_date, index_returns: Optional[pd.Series], min_obs: int = MIN_PRICE_OBS):
-    rows, excluded, data_map = [], [], {}
-    progress = st.progress(0.0)
-    items = list(name_to_symbol.items())
-    for i, (name, symbol) in enumerate(items):
-        ind, row = analyze_symbol(symbol, name, start_date, end_date, index_returns, min_obs=min_obs)
-        if ind is not None:
-            data_map[symbol] = ind
-            rows.append(row)
-        else:
-            excluded.append(row)
-        progress.progress((i + 1) / max(len(items), 1))
-    progress.empty()
-    return pd.DataFrame(rows), pd.DataFrame(excluded), data_map
-
-
-def smart_score_table(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    x = df.copy()
-    # Composite score: trend quality + risk-adjusted return + liquidity + drawdown control.
-    for col in ["Technical Score", "Sharpe", "Sortino", "3M Momentum %", "6M Momentum %", "Avg Daily TL Volume", "Max Drawdown %"]:
-        if col not in x.columns:
-            x[col] = np.nan
-    def rank_pct(s, higher=True):
-        return s.rank(pct=True, ascending=not higher) * 100
-    x["Composite Score"] = (
-        0.30 * x["Technical Score"] +
-        0.20 * rank_pct(x["Sharpe"].fillna(-999), True) +
-        0.15 * rank_pct(x["3M Momentum %"].fillna(-999), True) +
-        0.15 * rank_pct(x["6M Momentum %"].fillna(-999), True) +
-        0.10 * rank_pct(x["Avg Daily TL Volume"].fillna(0), True) +
-        0.10 * rank_pct(x["Max Drawdown %"].fillna(-999), True)
-    )
-    x["Action Lens"] = np.select(
-        [x["Composite Score"] >= 75, x["Composite Score"] >= 55, x["Composite Score"] >= 35],
-        ["Leadership Watch", "Constructive", "Neutral / Validate",],
-        default="High Risk / Weak"
-    )
-    return x.sort_values("Composite Score", ascending=False)
-
-# -------------------------------------------------------------------------
-# PORTFOLIO LAB
-# -------------------------------------------------------------------------
-def run_equal_weight_portfolio(symbols: List[str], start_date, end_date, idx_ind: Optional[pd.DataFrame] = None, min_len: int = 120):
-    if not symbols:
-        return None
-    prices = {}
-    for sym in symbols:
-        raw = get_data(sym, start_date, end_date)
-        if raw is None or len(raw) < min_len:
-            continue
-        ind = compute_indicators(raw)
-        if len(ind) >= min_len:
-            prices[sym] = ind["Close"]
-    if len(prices) < 2:
-        return None
-    px_df = pd.concat(prices, axis=1, join="inner").dropna()
-    if px_df.shape[0] < 60:
-        return None
-    ret = px_df.pct_change().dropna()
-    port_ret = ret.mean(axis=1)
-    idx_ret = None
-    if idx_ind is not None and "Close" in idx_ind.columns:
-        idx_ret = idx_ind["Close"].reindex(ret.index).ffill().pct_change().dropna()
-        common = port_ret.index.intersection(idx_ret.index)
-        port_ret, idx_ret, ret = port_ret.reindex(common), idx_ret.reindex(common), ret.reindex(common)
-    return {
-        "prices": px_df,
-        "returns": ret,
-        "port_ret": port_ret,
-        "idx_ret": idx_ret,
-        "eq_port": (1 + port_ret).cumprod(),
-        "eq_index": (1 + idx_ret).cumprod() if idx_ret is not None else None,
-        "corr": ret.corr(),
-        "asset_total_ret": (1 + ret).prod() - 1,
-        "metrics_port": compute_return_metrics(port_ret, idx_ret, "Equal Weight Basket"),
-        "metrics_index": compute_return_metrics(idx_ret, None, "XU100") if idx_ret is not None else {},
-    }
-
-# -------------------------------------------------------------------------
-# PLOT HELPERS
-# -------------------------------------------------------------------------
-def clean_fig(fig, height=520):
-    fig.update_layout(
-        template="plotly_white",
-        height=height,
-        hovermode="x unified",
-        margin=dict(l=18, r=18, t=55, b=22),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="#eef2f6", rangeslider_visible=False)
-    fig.update_yaxes(showgrid=True, gridcolor="#eef2f6")
-    return fig
-
-
-def strategy_chart(p: pd.DataFrame, title: str):
-    fig = make_subplots(
-        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.025,
-        row_heights=[0.42, 0.16, 0.14, 0.14, 0.14],
-        subplot_titles=(title, "MACD", "RSI", "ATR %", "Strategy Drawdown"),
-    )
-    fig.add_trace(go.Scatter(x=p.index, y=p["Close"], mode="lines", name="Adjusted Close", line=dict(width=1.7)), row=1, col=1)
-    for col, name, dash in [("EMA_50", "EMA 50", "dot"), ("EMA_200", "EMA 200", "solid"), ("BB_UPPER", "BB Upper", "dash"), ("BB_LOWER", "BB Lower", "dash")]:
-        if col in p.columns:
-            fig.add_trace(go.Scatter(x=p.index, y=p[col], mode="lines", name=name, line=dict(width=1.0, dash=dash)), row=1, col=1)
-    if "ATR_Stop" in p.columns:
-        fig.add_trace(go.Scatter(x=p.index, y=p["ATR_Stop"], mode="lines", name="ATR Stop", line=dict(width=1.2, dash="dot")), row=1, col=1)
-    buys = p[p.get("Signal", 0) == 1]
-    sells = p[p.get("Signal", 0) == -1]
-    if not buys.empty:
-        fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BUY", marker=dict(symbol="triangle-up", size=11, line=dict(width=1, color="black"))), row=1, col=1)
-    if not sells.empty:
-        fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL", marker=dict(symbol="triangle-down", size=11, line=dict(width=1, color="black"))), row=1, col=1)
-    fig.add_trace(go.Scatter(x=p.index, y=p["MACD"], mode="lines", name="MACD", line=dict(width=1.3)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=p.index, y=p["MACD_SIGNAL"], mode="lines", name="MACD Signal", line=dict(width=1.1, dash="dot")), row=2, col=1)
-    fig.add_trace(go.Bar(x=p.index, y=p["MACD_HIST"], name="MACD Hist"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=p.index, y=p["RSI"], mode="lines", name="RSI", line=dict(width=1.4)), row=3, col=1)
-    fig.add_hrect(y0=70, y1=100, opacity=0.08, line_width=0, row=3, col=1)
-    fig.add_hrect(y0=0, y1=30, opacity=0.08, line_width=0, row=3, col=1)
-    fig.add_trace(go.Scatter(x=p.index, y=p["ATR_Pct"] * 100, mode="lines", name="ATR %", line=dict(width=1.3)), row=4, col=1)
-    dd_col = "Strategy_Drawdown" if "Strategy_Drawdown" in p.columns else "Drawdown"
-    fig.add_trace(go.Scatter(x=p.index, y=p[dd_col] * 100, mode="lines", name="Drawdown %", fill="tozeroy"), row=5, col=1)
-    fig.update_yaxes(title_text="TRY", row=1, col=1)
-    fig.update_yaxes(title_text="%", row=4, col=1)
-    fig.update_yaxes(title_text="%", row=5, col=1)
-    return clean_fig(fig, height=1040)
-
-
-def equity_risk_chart(p: pd.DataFrame):
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.42, 0.28, 0.30], subplot_titles=("Equity Curves", "Rolling 60D Beta vs XU100", "Return Distribution"))
-    fig.add_trace(go.Scatter(x=p.index, y=p["BH_Equity"], name="Buy & Hold", mode="lines", line=dict(width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=p.index, y=p["Strategy_Equity"], name="Strategy", mode="lines", line=dict(width=2.0)), row=1, col=1)
-    if "Rolling_Beta_Asset" in p.columns:
-        fig.add_trace(go.Scatter(x=p.index, y=p["Rolling_Beta_Asset"], name="Asset Beta", mode="lines"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=p.index, y=p["Rolling_Beta_Strategy"], name="Strategy Beta", mode="lines"), row=2, col=1)
-    fig.add_trace(go.Histogram(x=p["Strategy_Return"] * 100, nbinsx=80, name="Strategy Daily Return %"), row=3, col=1)
-    return clean_fig(fig, height=880)
-
-
-def risk_return_bubble(df: pd.DataFrame, title: str):
-    if df.empty:
-        return go.Figure()
-    plot_df = df.copy()
-    plot_df["Bubble"] = np.sqrt(plot_df["Avg Daily TL Volume"].clip(lower=0).fillna(0))
-    fig = px.scatter(
-        plot_df,
-        x="Ann Vol %",
-        y="CAGR %",
-        size="Bubble",
-        hover_name="Name",
-        hover_data=["Symbol", "Sharpe", "Max Drawdown %", "Beta vs XU100", "Technical Score", "Composite Score"],
-        text="Symbol",
-        title=title,
-    )
-    fig.update_traces(textposition="top center", marker=dict(opacity=0.72, line=dict(width=0.7, color="#475467")))
-    return clean_fig(fig, height=650)
-
-
-def momentum_bar(df: pd.DataFrame, title: str, n: int = 20):
-    if df.empty:
-        return go.Figure()
-    cols = ["Name", "Symbol", "3M Momentum %", "6M Momentum %", "1Y Momentum %", "Composite Score"]
-    tmp = df[[c for c in cols if c in df.columns]].head(n).sort_values("Composite Score")
-    fig = go.Figure()
-    fig.add_trace(go.Bar(y=tmp["Symbol"], x=tmp["3M Momentum %"], orientation="h", name="3M"))
-    fig.add_trace(go.Bar(y=tmp["Symbol"], x=tmp["6M Momentum %"], orientation="h", name="6M"))
-    fig.update_layout(barmode="group", title=title, xaxis_title="Momentum %", yaxis_title="Ticker")
-    return clean_fig(fig, height=620)
-
-
-def corr_heatmap(corr: pd.DataFrame, title: str):
-    fig = go.Figure(data=go.Heatmap(z=corr.values, x=corr.columns, y=corr.index, zmin=-1, zmax=1, colorbar=dict(title="Corr")))
-    fig.update_layout(title=title)
-    return clean_fig(fig, height=650)
-
-
-def _institutional_css_gradient(series: pd.Series) -> list[str]:
-    """Matplotlib-free red/neutral/green gradient for Streamlit Cloud.
-
-    pandas Styler.background_gradient() imports matplotlib at render time. The
-    app intentionally avoids that optional dependency, so this helper creates
-    equivalent institutional table shading with plain CSS only.
-    """
-    numeric = pd.to_numeric(series, errors="coerce")
-    finite = numeric.replace([np.inf, -np.inf], np.nan).dropna()
-    if finite.empty:
-        return ["" for _ in series]
-
-    lo = float(finite.min())
-    hi = float(finite.max())
-    span = hi - lo
-    if not np.isfinite(span) or span <= 1e-12:
-        return [
-            "background-color: rgba(226,232,240,0.45); color: #0f172a;"
-            if pd.notna(value) else ""
-            for value in numeric
-        ]
-
-    styles: list[str] = []
-    for value in numeric:
-        if pd.isna(value):
-            styles.append("")
-            continue
-        z = float(np.clip((value - lo) / span, 0.0, 1.0))
-        if z < 0.5:
-            # Pale institutional red -> neutral grey.
-            w = z / 0.5
-            r = round(254 * (1 - w) + 241 * w)
-            g = round(226 * (1 - w) + 245 * w)
-            b = round(226 * (1 - w) + 249 * w)
-        else:
-            # Neutral grey -> pale institutional green.
-            w = (z - 0.5) / 0.5
-            r = round(241 * (1 - w) + 220 * w)
-            g = round(245 * (1 - w) + 252 * w)
-            b = round(249 * (1 - w) + 231 * w)
-        styles.append(
-            f"background-color: rgb({r},{g},{b}); color: #0f172a; "
-            "font-weight: 500;"
-        )
-    return styles
-
-
-def style_smart_table(df: pd.DataFrame):
-    fmt_cols = {c: "{:.2f}" for c in df.select_dtypes(include=[np.number]).columns}
-    pct_cols = [c for c in df.columns if "%" in c or c in ["ATR %", "From 52W High %", "From 52W Low %"]]
-    for c in pct_cols:
-        if c in fmt_cols:
-            fmt_cols[c] = "{:.2f}%"
-
-    sty = df.style.format(fmt_cols, na_rep="N/A")
-    gradient_columns = [
-        "Composite Score", "Technical Score", "Sharpe", "Sortino",
-        "CAGR %", "3M Momentum %", "6M Momentum %",
-    ]
-    for column in gradient_columns:
-        if column in df.columns:
-            sty = sty.apply(_institutional_css_gradient, subset=[column], axis=0)
-    return sty
-
-
-# -------------------------------------------------------------------------
-# VECTORISED LEADING SIGNAL LAB
-# Classic MA crossover method + advanced multi-confirmation signal engine.
-# Signals are generated at close and applied from the next bar to prevent
-# look-ahead bias. No synthetic data is used.
-# -------------------------------------------------------------------------
-def _signal_perf_metrics(ret: pd.Series, benchmark_ret: Optional[pd.Series] = None) -> Dict[str, float]:
-    r = pd.Series(ret).replace([np.inf, -np.inf], np.nan).dropna()
-    if r.empty:
-        return {
-            "Total Return %": np.nan, "CAGR %": np.nan, "Ann Vol %": np.nan,
-            "Sharpe": np.nan, "Sortino": np.nan, "Max Drawdown %": np.nan,
-            "Win Rate %": np.nan, "Positive Days": 0, "Active Days": 0,
-            "Beta vs XU100": np.nan, "Information Ratio": np.nan,
-        }
-    eq=(1+r).cumprod()
-    total=eq.iloc[-1]-1
-    years=max(len(r)/TRADING_DAYS, 1/TRADING_DAYS)
-    cagr=(1+total)**(1/years)-1 if total > -1 else np.nan
-    vol=r.std(ddof=1)*np.sqrt(TRADING_DAYS)
-    sharpe=(r.mean()*TRADING_DAYS/vol) if vol and np.isfinite(vol) and vol>0 else np.nan
-    downside=r[r<0].std(ddof=1)*np.sqrt(TRADING_DAYS)
-    sortino=(r.mean()*TRADING_DAYS/downside) if downside and np.isfinite(downside) and downside>0 else np.nan
-    dd=eq/eq.cummax()-1
-    active=r[r!=0]
-    beta=ir=np.nan
-    if benchmark_ret is not None:
-        pair=pd.concat([r.rename('strategy'), pd.Series(benchmark_ret).rename('benchmark')], axis=1).dropna()
-        if len(pair)>2 and pair['benchmark'].var(ddof=1)>0:
-            beta=pair['strategy'].cov(pair['benchmark'])/pair['benchmark'].var(ddof=1)
-            active_ret=pair['strategy']-pair['benchmark']
-            te=active_ret.std(ddof=1)*np.sqrt(TRADING_DAYS)
-            ir=(active_ret.mean()*TRADING_DAYS/te) if te and np.isfinite(te) and te>0 else np.nan
-    return {
-        "Total Return %": total*100, "CAGR %": cagr*100, "Ann Vol %": vol*100,
-        "Sharpe": sharpe, "Sortino": sortino, "Max Drawdown %": dd.min()*100,
-        "Win Rate %": (active.gt(0).mean()*100 if not active.empty else np.nan),
-        "Positive Days": int(active.gt(0).sum()), "Active Days": int(active.size),
-        "Beta vs XU100": beta, "Information Ratio": ir,
-    }
-
-def run_leading_signal_lab(
-    df: pd.DataFrame,
-    mode: str = "Classic SMA Crossover",
-    fast_window: int = 20,
-    slow_window: int = 50,
-    breakout_window: int = 20,
-    entry_score: int = 4,
-    exit_score: int = 2,
-    use_volume_confirmation: bool = True,
-    market_regime: Optional[pd.Series] = None,
-    benchmark_ret: Optional[pd.Series] = None,
-    transaction_cost_bps: float = 8.0,
-    slippage_bps: float = 4.0,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    x=df.copy().sort_index()
-    close=x['Close'].astype(float)
-    x['SMA_Fast']=close.rolling(fast_window, min_periods=fast_window).mean()
-    x['SMA_Slow']=close.rolling(slow_window, min_periods=slow_window).mean()
-    x['EMA_Fast']=close.ewm(span=fast_window, adjust=False, min_periods=fast_window).mean()
-    x['EMA_Slow']=close.ewm(span=slow_window, adjust=False, min_periods=slow_window).mean()
-    x['Prior_High']=close.rolling(breakout_window, min_periods=breakout_window).max().shift(1)
-    x['Volume_Median_20']=x['Volume'].rolling(20, min_periods=20).median()
-    x['Return_Lab']=close.pct_change().fillna(0.0)
-
-    if mode == "Classic SMA Crossover":
-        x['Trend_Pass']=x['SMA_Fast'] > x['SMA_Slow']
-        x['Breakout_Pass']=False
-        x['MACD_Pass']=False
-        x['RSI_Pass']=False
-        x['Volume_Pass']=True
-        x['Market_Pass']=True if market_regime is None else market_regime.reindex(x.index).ffill().fillna(False)
-        desired=(x['Trend_Pass'] & x['Market_Pass']).astype(int)
-        x['Signal_Score']=x['Trend_Pass'].astype(int)+x['Market_Pass'].astype(int)
-    else:
-        x['Trend_Pass']=(x['EMA_Fast'] > x['EMA_Slow']) & (close > x['EMA_Slow'])
-        x['Breakout_Pass']=close > x['Prior_High']
-        x['MACD_Pass']=(x['MACD_HIST'] > 0) & (x['MACD_HIST'] > x['MACD_HIST'].shift(1))
-        x['RSI_Pass']=(x['RSI'] >= 50) & (x['RSI'] <= 75)
-        x['Volume_Pass']=(x['Volume'] > x['Volume_Median_20']) if use_volume_confirmation else True
-        x['Market_Pass']=True if market_regime is None else market_regime.reindex(x.index).ffill().fillna(False)
-        score_cols=['Trend_Pass','Breakout_Pass','MACD_Pass','RSI_Pass','Volume_Pass','Market_Pass']
-        x['Signal_Score']=sum(x[c].astype(int) for c in score_cols)
-        state=0
-        desired_vals=[]
-        for score in x['Signal_Score'].fillna(0).astype(int):
-            if state==0 and score>=entry_score:
-                state=1
-            elif state==1 and score<=exit_score:
-                state=0
-            desired_vals.append(state)
-        desired=pd.Series(desired_vals,index=x.index,dtype=int)
-
-    x['Desired_Position']=desired.astype(int)
-    # Decision at today's close; exposure begins on the next bar.
-    x['Position_Lab']=x['Desired_Position'].shift(1).fillna(0).astype(int)
-    x['Position_Change']=x['Position_Lab'].diff().abs().fillna(x['Position_Lab'].abs())
-    one_way_cost=(transaction_cost_bps+slippage_bps)/10000.0
-    x['Trading_Cost_Lab']=x['Position_Change']*one_way_cost
-    x['Gross_Strategy_Return_Lab']=x['Position_Lab']*x['Return_Lab']
-    x['Strategy_Return_Lab']=x['Gross_Strategy_Return_Lab']-x['Trading_Cost_Lab']
-    x['BuyHold_Equity_Lab']=(1+x['Return_Lab']).cumprod()
-    x['Strategy_Equity_Lab']=(1+x['Strategy_Return_Lab']).cumprod()
-    x['Signal_Event']=np.select(
-        [x['Desired_Position'].eq(1)&x['Desired_Position'].shift(1).fillna(0).eq(0),
-         x['Desired_Position'].eq(0)&x['Desired_Position'].shift(1).fillna(0).eq(1)],
-        ['AL','SAT'], default='')
-    x['Leading_Action']=np.where(x['Signal_Event'].ne(''),x['Signal_Event'],np.where(x['Desired_Position'].eq(1),'TUT','BEKLE'))
-    metrics=_signal_perf_metrics(x['Strategy_Return_Lab'], benchmark_ret)
-    metrics['Signal Count']=int(x['Signal_Event'].isin(['AL','SAT']).sum())
-    metrics['Buy Signals']=int(x['Signal_Event'].eq('AL').sum())
-    metrics['Sell Signals']=int(x['Signal_Event'].eq('SAT').sum())
-    metrics['Exposure %']=float(x['Position_Lab'].mean()*100)
-    return x,metrics
-
-def leading_signal_chart(df: pd.DataFrame, title: str) -> go.Figure:
-    fig=make_subplots(rows=3,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.52,0.23,0.25],subplot_titles=("Price, Averages and Signal Events","Signal Confirmation Score","Strategy vs Buy & Hold"))
-    fig.add_trace(go.Scatter(x=df.index,y=df['Close'],mode='lines',name='Close'),row=1,col=1)
-    for col,name in [('SMA_Fast','Fast SMA'),('SMA_Slow','Slow SMA'),('EMA_Fast','Fast EMA'),('EMA_Slow','Slow EMA')]:
-        if col in df.columns:
-            fig.add_trace(go.Scatter(x=df.index,y=df[col],mode='lines',name=name,line=dict(width=1.1)),row=1,col=1)
-    buys=df[df['Signal_Event']=='AL']; sells=df[df['Signal_Event']=='SAT']
-    fig.add_trace(go.Scatter(x=buys.index,y=buys['Close'],mode='markers',name='AL',marker=dict(symbol='triangle-up',size=12)),row=1,col=1)
-    fig.add_trace(go.Scatter(x=sells.index,y=sells['Close'],mode='markers',name='SAT',marker=dict(symbol='triangle-down',size=12)),row=1,col=1)
-    fig.add_trace(go.Bar(x=df.index,y=df['Signal_Score'],name='Confirmation Score'),row=2,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df['Strategy_Equity_Lab'],mode='lines',name='Signal Strategy'),row=3,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df['BuyHold_Equity_Lab'],mode='lines',name='Buy & Hold'),row=3,col=1)
-    fig.update_layout(title=title,hovermode='x unified',height=900,template='plotly_white',margin=dict(l=20,r=20,t=60,b=20))
-    return fig
-
-
-# -------------------------------------------------------------------------
-# INSTITUTIONAL LEADING SIGNAL ENGINE V5.0.2
-# -------------------------------------------------------------------------
-def _safe_percentile_rank(series: pd.Series, window: int = 252) -> pd.Series:
-    s = pd.Series(series, dtype=float)
-    return s.rolling(window, min_periods=max(40, window // 4)).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
-    )
-
-def build_institutional_signal_engine(
-    df: pd.DataFrame,
-    benchmark_close: Optional[pd.Series] = None,
-    benchmark_returns: Optional[pd.Series] = None,
-    forward_horizon: int = 60,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
-    """Explainable 100-point decision engine using only observed market data.
-
-    The current score uses information available through each close. Historical
-    probability estimates use only rows whose forward outcome is already known.
-    """
-    x = df.copy().sort_index()
-    close = x['Close'].astype(float)
-    ret = close.pct_change()
-
-    # Core derived series
-    ema20 = close.ewm(span=20, adjust=False, min_periods=20).mean()
-    ema50 = close.ewm(span=50, adjust=False, min_periods=50).mean()
-    ema200 = close.ewm(span=200, adjust=False, min_periods=200).mean()
-    roc20 = close.pct_change(20)
-    roc60 = close.pct_change(60)
-    vol20 = ret.rolling(20, min_periods=20).std() * np.sqrt(TRADING_DAYS)
-    vol60 = ret.rolling(60, min_periods=40).std() * np.sqrt(TRADING_DAYS)
-    drawdown = close / close.cummax() - 1.0
-    atr_pct = x['ATR'].astype(float) / close.replace(0, np.nan) if 'ATR' in x else pd.Series(np.nan, index=x.index)
-
-    volume = x['Volume'].astype(float)
-    vol_med20 = volume.rolling(20, min_periods=20).median()
-    obv = (np.sign(ret.fillna(0.0)) * volume).cumsum()
-    obv_ma20 = obv.rolling(20, min_periods=20).mean()
-
-    # Relative strength against XU100
-    if benchmark_close is not None:
-        bclose = pd.Series(benchmark_close, dtype=float).reindex(x.index).ffill()
-        rs = close / bclose.replace(0, np.nan)
-        rs20 = rs.pct_change(20)
-        rs60 = rs.pct_change(60)
-    else:
-        rs20 = pd.Series(0.0, index=x.index)
-        rs60 = pd.Series(0.0, index=x.index)
-
-    # Rolling beta/alpha proxies
-    if benchmark_returns is not None:
-        bret = pd.Series(benchmark_returns, dtype=float).reindex(x.index)
-        pair = pd.concat([ret.rename('asset'), bret.rename('bench')], axis=1)
-        cov = pair['asset'].rolling(60, min_periods=40).cov(pair['bench'])
-        var = pair['bench'].rolling(60, min_periods=40).var()
-        beta60 = cov / var.replace(0, np.nan)
-        alpha60 = (pair['asset'].rolling(60, min_periods=40).mean() - beta60 * pair['bench'].rolling(60, min_periods=40).mean()) * TRADING_DAYS
-        market_pass = (bclose > bclose.ewm(span=200, adjust=False, min_periods=200).mean()).astype(float) if benchmark_close is not None else pd.Series(0.5, index=x.index)
-    else:
-        beta60 = pd.Series(np.nan, index=x.index)
-        alpha60 = pd.Series(np.nan, index=x.index)
-        market_pass = pd.Series(0.5, index=x.index)
-
-    # 1) Trend: 20 points
-    trend_score = (
-        7.0 * (close > ema50).astype(float) +
-        7.0 * (ema50 > ema200).astype(float) +
-        6.0 * ((x.get('ADX', pd.Series(0, index=x.index)) > 18) & (x.get('ST_Dir', pd.Series(1, index=x.index)) >= 0)).astype(float)
-    )
-
-    # 2) Momentum: 20 points
-    rsi = x.get('RSI', pd.Series(50.0, index=x.index)).astype(float)
-    macd_hist = x.get('MACD_HIST', pd.Series(0.0, index=x.index)).astype(float)
-    momentum_score = (
-        6.0 * (roc20 > 0).astype(float) +
-        5.0 * (roc60 > 0).astype(float) +
-        5.0 * ((rsi >= 50) & (rsi <= 72)).astype(float) +
-        4.0 * ((macd_hist > 0) & (macd_hist > macd_hist.shift(1))).astype(float)
-    )
-
-    # 3) Relative strength: 15 points
-    relative_score = 8.0 * (rs20 > 0).astype(float) + 7.0 * (rs60 > 0).astype(float)
-
-    # 4) Volume/flow: 15 points
-    volume_score = (
-        7.0 * (volume > vol_med20).astype(float) +
-        5.0 * (obv > obv_ma20).astype(float) +
-        3.0 * (volume.pct_change(5) > 0).astype(float)
-    )
-
-    # 5) Volatility quality: 10 points; reward controlled, non-expanding risk
-    vol_rank = _safe_percentile_rank(vol20, 252)
-    volatility_score = (
-        5.0 * (vol20 <= vol60).astype(float) +
-        3.0 * (vol_rank <= 0.75).astype(float) +
-        2.0 * (atr_pct <= atr_pct.rolling(60, min_periods=30).median()).astype(float)
-    )
-
-    # 6) Risk quality: 10 points
-    risk_score = (
-        4.0 * (drawdown > -0.15).astype(float) +
-        3.0 * ((beta60.isna()) | (beta60 <= 1.25)).astype(float) +
-        3.0 * ((alpha60.isna()) | (alpha60 > 0)).astype(float)
-    )
-
-    # 7) Market regime: 10 points
-    market_score = 10.0 * market_pass.clip(0, 1)
-
-    factors = {
-        'Trend Score': trend_score,
-        'Momentum Score': momentum_score,
-        'Relative Strength Score': relative_score,
-        'Volume Score': volume_score,
-        'Volatility Score': volatility_score,
-        'Risk Score': risk_score,
-        'Market Regime Score': market_score,
-    }
-    for name, series in factors.items():
-        x[name] = pd.Series(series, index=x.index).fillna(0.0)
-    x['Institutional Score'] = sum(x[name] for name in factors).clip(0, 100)
-
-    # Confidence rewards broad factor agreement and stable recent score.
-    # Use a plain dictionary and iterate over .items(). Iterating directly
-    # over a pandas Series returns its VALUES (20, 20, 15, ...), not its index.
-    # The previous code therefore attempted x[20] and raised KeyError.
-    factor_max = {
-        'Trend Score': 20.0,
-        'Momentum Score': 20.0,
-        'Relative Strength Score': 15.0,
-        'Volume Score': 15.0,
-        'Volatility Score': 10.0,
-        'Risk Score': 10.0,
-        'Market Regime Score': 10.0,
-    }
-
-    missing_factor_columns = [name for name in factor_max if name not in x.columns]
-    if missing_factor_columns:
-        raise ValueError(
-            "Institutional signal engine is missing factor columns: "
-            + ", ".join(missing_factor_columns)
-        )
-
-    normalized = pd.DataFrame(
-        {
-            name: pd.to_numeric(x[name], errors='coerce').fillna(0.0) / maximum
-            for name, maximum in factor_max.items()
-        },
-        index=x.index,
-    )
-    agreement = 1.0 - normalized.std(axis=1).clip(0, 0.5) / 0.5
-    stability = 1.0 - (x['Institutional Score'].rolling(20, min_periods=5).std() / 25.0).clip(0, 1)
-    x['Confidence Score'] = (100.0 * (0.6 * agreement + 0.4 * stability)).clip(0, 100)
-
-    x['Recommendation'] = pd.cut(
-        x['Institutional Score'],
-        bins=[-np.inf, 25, 40, 60, 75, np.inf],
-        labels=['STRONG SELL', 'SELL', 'HOLD', 'BUY', 'STRONG BUY'],
-    ).astype(str)
-
-    # Historical empirical probabilities from resolved forward outcomes only.
-    x[f'Forward {forward_horizon}D Return'] = close.shift(-forward_horizon) / close - 1.0
-    if benchmark_close is not None:
-        bench_fwd = bclose.shift(-forward_horizon) / bclose - 1.0
-        x[f'Forward {forward_horizon}D Active Return'] = x[f'Forward {forward_horizon}D Return'] - bench_fwd
-    else:
-        x[f'Forward {forward_horizon}D Active Return'] = np.nan
-
-    current_score = float(x['Institutional Score'].iloc[-1])
-    resolved = x.iloc[:-forward_horizon].dropna(subset=[f'Forward {forward_horizon}D Return']) if len(x) > forward_horizon else x.iloc[0:0]
-    band = 7.5
-    peers = resolved[(resolved['Institutional Score'] >= current_score - band) & (resolved['Institutional Score'] <= current_score + band)]
-    if len(peers) < 20 and not resolved.empty:
-        peers = resolved.assign(_dist=(resolved['Institutional Score'] - current_score).abs()).nsmallest(min(60, len(resolved)), '_dist')
-
-    positive_prob = float((peers[f'Forward {forward_horizon}D Return'] > 0).mean() * 100) if len(peers) else np.nan
-    plus10_prob = float((peers[f'Forward {forward_horizon}D Return'] >= 0.10).mean() * 100) if len(peers) else np.nan
-    active_col = f'Forward {forward_horizon}D Active Return'
-    outperform_prob = float((peers[active_col] > 0).mean() * 100) if len(peers) and peers[active_col].notna().any() else np.nan
-
-    latest = x.iloc[-1]
-    summary = {
-        'Institutional Score': float(latest['Institutional Score']),
-        'Confidence Score': float(latest['Confidence Score']),
-        'Recommendation': str(latest['Recommendation']),
-        f'Positive Return Probability {forward_horizon}D %': positive_prob,
-        f'+10% Probability {forward_horizon}D %': plus10_prob,
-        f'Outperform XU100 Probability {forward_horizon}D %': outperform_prob,
-        'Historical Analog Count': int(len(peers)),
-    }
-
-    factor_names = list(factor_max.keys())
-    contribution = pd.DataFrame({
-        'Factor': factor_names,
-        'Score': [float(latest[name]) for name in factor_names],
-        'Maximum': [float(factor_max[name]) for name in factor_names],
-    })
-    contribution['Contribution %'] = contribution['Score'] / contribution['Maximum'] * 100.0
-    return x, contribution, summary
-
-def institutional_score_chart(score_df: pd.DataFrame) -> go.Figure:
-    score_df = score_df.copy().sort_index()
-    fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-        row_heights=[0.50, 0.22, 0.28],
-        specs=[[{'secondary_y': True}], [{'secondary_y': False}], [{'secondary_y': False}]],
-        subplot_titles=(
-            'Adjusted Price Structure — Candles, Trend Channel, Anchored VWAP, Swing Structure, Targets & Volume',
-            'Institutional Score and Confidence',
-            'Factor Contribution History',
-        ),
-    )
-
-    regime_color_map = {
-        'STRONG BUY': 'rgba(22,163,74,0.10)',
-        'BUY': 'rgba(132,204,22,0.08)',
-        'HOLD': 'rgba(245,158,11,0.07)',
-        'SELL': 'rgba(249,115,22,0.08)',
-        'STRONG SELL': 'rgba(220,38,38,0.10)',
-    }
-    regime_marker_map = {
-        'STRONG BUY': '#16a34a',
-        'BUY': '#84cc16',
-        'HOLD': '#f59e0b',
-        'SELL': '#f97316',
-        'STRONG SELL': '#dc2626',
-    }
-
-    # --- derived price-structure helpers ---
-    resistance_20 = score_df['High'].rolling(20, min_periods=10).max()
-    support_20 = score_df['Low'].rolling(20, min_periods=10).min()
-    resistance_60 = score_df['High'].rolling(60, min_periods=30).max()
-    support_60 = score_df['Low'].rolling(60, min_periods=30).min()
-    volume_colors = np.where(score_df['Close'] >= score_df['Open'], '#16a34a', '#dc2626')
-    regime = score_df['Recommendation'].fillna('HOLD').astype(str) if 'Recommendation' in score_df.columns else pd.Series('HOLD', index=score_df.index)
-
-    # --- dynamic trend channel (recent regression channel) ---
-    channel_lookback = int(min(90, max(40, len(score_df))))
-    trend_mid = pd.Series(np.nan, index=score_df.index, dtype=float)
-    trend_upper = pd.Series(np.nan, index=score_df.index, dtype=float)
-    trend_lower = pd.Series(np.nan, index=score_df.index, dtype=float)
-    channel_slice = score_df.iloc[-channel_lookback:].copy()
-    if len(channel_slice) >= 20:
-        x_idx = np.arange(len(channel_slice), dtype=float)
-        slope, intercept = np.polyfit(x_idx, channel_slice['Close'].astype(float).values, 1)
-        fitted = intercept + slope * x_idx
-        resid_std = float(np.nanstd(channel_slice['Close'].astype(float).values - fitted, ddof=1)) if len(channel_slice) > 2 else 0.0
-        atr_pad = float(channel_slice['ATR'].tail(20).median()) if 'ATR' in channel_slice.columns and channel_slice['ATR'].notna().any() else 0.0
-        channel_width = max(resid_std * 1.40, atr_pad * 1.20, 1e-9)
-        trend_mid.loc[channel_slice.index] = fitted
-        trend_upper.loc[channel_slice.index] = fitted + channel_width
-        trend_lower.loc[channel_slice.index] = fitted - channel_width
-    else:
-        channel_width = np.nan
-
-    # --- anchored VWAP anchored to latest swing low or fallback recent support ---
-    low = score_df['Low'].astype(float)
-    high = score_df['High'].astype(float)
-    close = score_df['Close'].astype(float)
-    volume = score_df['Volume'].astype(float)
-    typical_price = (high + low + close) / 3.0
-    swing_low_mask = (low.shift(2) > low.shift(1)) & (low.shift(1) > low) & (low.shift(-1) > low) & (low.shift(-2) > low)
-    swing_high_mask = (high.shift(2) < high.shift(1)) & (high.shift(1) < high) & (high.shift(-1) < high) & (high.shift(-2) < high)
-    recent_window = min(150, len(score_df))
-    recent_index = score_df.index[-recent_window:]
-    recent_swing_lows = score_df.index[swing_low_mask.fillna(False) & score_df.index.isin(recent_index)]
-    recent_swing_highs = score_df.index[swing_high_mask.fillna(False) & score_df.index.isin(recent_index)]
-    if len(recent_swing_lows) > 0:
-        anchor_date = recent_swing_lows[-1]
-    else:
-        anchor_date = score_df.index[max(0, len(score_df) - 60)]
-    anchor_mask = score_df.index >= anchor_date
-    anchored_vwap = pd.Series(np.nan, index=score_df.index, dtype=float)
-    cum_pv = (typical_price[anchor_mask] * volume[anchor_mask]).cumsum()
-    cum_vol = volume[anchor_mask].cumsum().replace(0, np.nan)
-    anchored_vwap.loc[anchor_mask] = cum_pv / cum_vol
-
-    # --- regime shading on price panel ---
-    if len(score_df) > 1:
-        group_id = (regime != regime.shift(1)).cumsum()
-        temp = score_df.copy()
-        temp['_group_id'] = group_id.values
-        for _, seg in temp.groupby('_group_id'):
-            label = str(seg['Recommendation'].iloc[0]) if 'Recommendation' in seg.columns else 'HOLD'
-            fig.add_vrect(
-                x0=seg.index[0], x1=seg.index[-1],
-                fillcolor=regime_color_map.get(label, 'rgba(148,163,184,0.08)'),
-                opacity=0.32, line_width=0, row=1, col=1
-            )
-
-    # --- row 1: price panel ---
+    sh = (high.shift(2) < high.shift(1)) & (high.shift(1) < high) & (high.shift(-1) < high) & (high.shift(-2) < high)
+    sl = (low.shift(2) > low.shift(1)) & (low.shift(1) > low) & (low.shift(-1) > low) & (low.shift(-2) > low)
+    return df.loc[sh.fillna(False), ["High"]], df.loc[sl.fillna(False), ["Low"]]
+
+
+def build_price_chart(df: pd.DataFrame, title: str) -> go.Figure:
+    plot_df = df.tail(min(520, len(df))).copy()
+    channel = trend_channel(plot_df["Analysis Price"], 90)
+    avwap, anchor = anchored_vwap(plot_df, 150)
+    swing_high, swing_low = swing_points(plot_df)
+    support_20 = plot_df["Low"].rolling(20, min_periods=10).min()
+    resistance_20 = plot_df["High"].rolling(20, min_periods=10).max()
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.78, 0.22])
     fig.add_trace(
         go.Candlestick(
-            x=score_df.index, open=score_df['Open'], high=score_df['High'], low=score_df['Low'], close=score_df['Close'],
-            name='Adjusted OHLC', increasing_line_color='#16a34a', decreasing_line_color='#dc2626',
-            increasing_fillcolor='rgba(22,163,74,0.75)', decreasing_fillcolor='rgba(220,38,38,0.75)',
-            whiskerwidth=0.4, opacity=0.95,
+            x=plot_df.index,
+            open=plot_df["Open"],
+            high=plot_df["High"],
+            low=plot_df["Low"],
+            close=plot_df["Close"],
+            name="OHLC",
+            increasing_line_color="#176b45",
+            decreasing_line_color="#9f2d2d",
         ),
-        row=1, col=1, secondary_y=False
+        row=1,
+        col=1,
     )
+    for col, name, color, width, dash in [
+        ("EMA 20", "EMA 20", "#2563eb", 1.2, "solid"),
+        ("EMA 50", "EMA 50", "#d97706", 1.4, "solid"),
+        ("EMA 200", "EMA 200", "#111827", 1.7, "dash"),
+    ]:
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df[col], mode="lines", name=name, line=dict(color=color, width=width, dash=dash)), row=1, col=1)
 
-    # Bollinger envelope
-    if 'BB_UPPER' in score_df.columns and 'BB_LOWER' in score_df.columns:
-        fig.add_trace(
-            go.Scatter(x=score_df.index, y=score_df['BB_UPPER'], mode='lines', line=dict(width=1.0, dash='dot', color='rgba(59,130,246,0.50)'), name='BB Upper'),
-            row=1, col=1, secondary_y=False
-        )
-        fig.add_trace(
-            go.Scatter(x=score_df.index, y=score_df['BB_LOWER'], mode='lines', line=dict(width=1.0, dash='dot', color='rgba(59,130,246,0.50)'), fill='tonexty', fillcolor='rgba(59,130,246,0.08)', name='Bollinger Envelope'),
-            row=1, col=1, secondary_y=False
-        )
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB Upper"], mode="lines", name="BB Upper", line=dict(color="rgba(59,130,246,0.45)", width=0.8, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB Lower"], mode="lines", name="BB Envelope", line=dict(color="rgba(59,130,246,0.45)", width=0.8, dash="dot"), fill="tonexty", fillcolor="rgba(59,130,246,0.06)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=channel.index, y=channel["Upper"], mode="lines", name="Trend Channel Upper", line=dict(color="#0891b2", width=1.0, dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=channel.index, y=channel["Lower"], mode="lines", name="Trend Channel Lower", line=dict(color="#0891b2", width=1.0, dash="dash"), fill="tonexty", fillcolor="rgba(8,145,178,0.06)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=channel.index, y=channel["Mid"], mode="lines", name="Trend Channel Mid", line=dict(color="#0f766e", width=1.2, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=avwap, mode="lines", name=f"Anchored VWAP ({anchor.date() if anchor is not None else 'N/A'})", line=dict(color="#7c3aed", width=1.8)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=resistance_20, mode="lines", name="20D Resistance", line=dict(color="#a855f7", width=0.9, dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=support_20, mode="lines", name="20D Support", line=dict(color="#0f766e", width=0.9, dash="dash")), row=1, col=1)
 
-    # Trend averages
-    ema_specs = [('EMA_20', 'EMA 20', '#2563eb', 1.4, 'solid'), ('EMA_50', 'EMA 50', '#f59e0b', 1.6, 'solid'), ('EMA_200', 'EMA 200', '#111827', 1.8, 'dash')]
-    for col, name, color, width, dash in ema_specs:
-        if col in score_df.columns:
-            fig.add_trace(go.Scatter(x=score_df.index, y=score_df[col], mode='lines', name=name, line=dict(color=color, width=width, dash=dash)), row=1, col=1, secondary_y=False)
+    for points, col, label, color, pos in [
+        (swing_high.tail(4), "High", "Swing High", "#9333ea", "top center"),
+        (swing_low.tail(4), "Low", "Swing Low", "#0f766e", "bottom center"),
+    ]:
+        if not points.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=points.index,
+                    y=points[col],
+                    mode="markers+text",
+                    text=["SH" if label == "Swing High" else "SL"] * len(points),
+                    textposition=pos,
+                    name=label,
+                    marker=dict(size=8, symbol="diamond", color=color, line=dict(color="white", width=0.7)),
+                ),
+                row=1,
+                col=1,
+            )
 
-    # Dynamic trend channel
-    if trend_mid.notna().any():
-        fig.add_trace(go.Scatter(x=score_df.index, y=trend_upper, mode='lines', name='Trend Channel Upper', line=dict(color='#0891b2', width=1.2, dash='dash')), row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=score_df.index, y=trend_lower, mode='lines', name='Trend Channel Lower', line=dict(color='#0891b2', width=1.2, dash='dash'), fill='tonexty', fillcolor='rgba(8,145,178,0.08)'), row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=score_df.index, y=trend_mid, mode='lines', name='Trend Channel Mid', line=dict(color='#0f766e', width=1.4, dash='dot')), row=1, col=1, secondary_y=False)
+    volume_colors = np.where(plot_df["Close"] >= plot_df["Open"], "#176b45", "#9f2d2d")
+    fig.add_trace(go.Bar(x=plot_df.index, y=plot_df["Volume"], name="Volume", marker_color=volume_colors, opacity=0.55), row=2, col=1)
 
-    # Anchored VWAP
-    if anchored_vwap.notna().any():
-        fig.add_trace(go.Scatter(x=score_df.index, y=anchored_vwap, mode='lines', name='Anchored VWAP', line=dict(color='#7c3aed', width=2.0)), row=1, col=1, secondary_y=False)
-
-    # Support / resistance bands
-    fig.add_trace(go.Scatter(x=score_df.index, y=resistance_20, mode='lines', name='20D Resistance', line=dict(color='#a855f7', width=1.1, dash='dash')), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=score_df.index, y=support_20, mode='lines', name='20D Support', line=dict(color='#0f766e', width=1.1, dash='dash')), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=score_df.index, y=resistance_60, mode='lines', name='60D Resistance', line=dict(color='#c026d3', width=1.0, dash='dot')), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=score_df.index, y=support_60, mode='lines', name='60D Support', line=dict(color='#14b8a6', width=1.0, dash='dot')), row=1, col=1, secondary_y=False)
-
-    # Buy / Sell markers based on recommendation regime changes
-    rec_prev = regime.shift(1).fillna('HOLD')
-    buy_mask = regime.isin(['BUY', 'STRONG BUY']) & ~rec_prev.isin(['BUY', 'STRONG BUY'])
-    sell_mask = regime.isin(['SELL', 'STRONG SELL']) & ~rec_prev.isin(['SELL', 'STRONG SELL'])
-    hold_mask = (regime == 'HOLD') & (rec_prev != 'HOLD')
-    if buy_mask.any():
-        fig.add_trace(go.Scatter(x=score_df.index[buy_mask], y=score_df.loc[buy_mask, 'Low'] * 0.985, mode='markers', name='BUY Signal', marker=dict(symbol='triangle-up', size=12, color='#16a34a', line=dict(width=1.1, color='white')), hovertemplate='Date=%{x}<br>BUY Signal<br>Adjusted Price=%{y:.2f}<extra></extra>'), row=1, col=1, secondary_y=False)
-    if sell_mask.any():
-        fig.add_trace(go.Scatter(x=score_df.index[sell_mask], y=score_df.loc[sell_mask, 'High'] * 1.015, mode='markers', name='SELL Signal', marker=dict(symbol='triangle-down', size=12, color='#dc2626', line=dict(width=1.1, color='white')), hovertemplate='Date=%{x}<br>SELL Signal<br>Adjusted Price=%{y:.2f}<extra></extra>'), row=1, col=1, secondary_y=False)
-    if hold_mask.any():
-        fig.add_trace(go.Scatter(x=score_df.index[hold_mask], y=score_df.loc[hold_mask, 'Close'], mode='markers', name='HOLD / Neutral', marker=dict(symbol='circle', size=8, color='#f59e0b', line=dict(width=0.8, color='white')), hovertemplate='Date=%{x}<br>HOLD / Neutral<br>Adjusted Close=%{y:.2f}<extra></extra>'), row=1, col=1, secondary_y=False)
-
-    # Swing high / low labels (last few only for readability)
-    swing_high_points = score_df.loc[swing_high_mask.fillna(False), ['High']].tail(4)
-    swing_low_points = score_df.loc[swing_low_mask.fillna(False), ['Low']].tail(4)
-    if not swing_high_points.empty:
-        fig.add_trace(go.Scatter(x=swing_high_points.index, y=swing_high_points['High'] * 1.01, mode='markers+text', name='Swing High', text=['SH'] * len(swing_high_points), textposition='top center', marker=dict(symbol='diamond', size=9, color='#9333ea', line=dict(width=0.8, color='white')), hovertemplate='Date=%{x}<br>Swing High=%{y:.2f}<extra></extra>'), row=1, col=1, secondary_y=False)
-    if not swing_low_points.empty:
-        fig.add_trace(go.Scatter(x=swing_low_points.index, y=swing_low_points['Low'] * 0.99, mode='markers+text', name='Swing Low', text=['SL'] * len(swing_low_points), textposition='bottom center', marker=dict(symbol='diamond', size=9, color='#0f766e', line=dict(width=0.8, color='white')), hovertemplate='Date=%{x}<br>Swing Low=%{y:.2f}<extra></extra>'), row=1, col=1, secondary_y=False)
-
-    # Latest regime marker
-    latest = score_df.iloc[-1]
-    latest_regime = str(latest.get('Recommendation', 'HOLD'))
-    fig.add_trace(go.Scatter(x=[score_df.index[-1]], y=[latest['Close']], mode='markers', name=f'Latest Regime: {latest_regime}', marker=dict(size=13, color=regime_marker_map.get(latest_regime, '#64748b'), line=dict(width=1.2, color='white')), hovertemplate='Date=%{x}<br>Adjusted Close=%{y:.2f}<br>Recommendation=' + latest_regime + '<extra></extra>'), row=1, col=1, secondary_y=False)
-
-    # Price target box near the right edge
-    latest_close = float(latest['Close'])
-    target_floor = float(np.nanmax([latest_close, resistance_20.iloc[-1] if pd.notna(resistance_20.iloc[-1]) else np.nan, anchored_vwap.iloc[-1] if pd.notna(anchored_vwap.iloc[-1]) else np.nan]))
-    target_ceiling = float(np.nanmax([target_floor, resistance_60.iloc[-1] if pd.notna(resistance_60.iloc[-1]) else np.nan, trend_upper.iloc[-1] if pd.notna(trend_upper.iloc[-1]) else np.nan]))
-    support_floor = float(np.nanmin([support_20.iloc[-1] if pd.notna(support_20.iloc[-1]) else latest_close, support_60.iloc[-1] if pd.notna(support_60.iloc[-1]) else latest_close, trend_lower.iloc[-1] if pd.notna(trend_lower.iloc[-1]) else latest_close]))
-    target_box_x0 = score_df.index[max(0, len(score_df) - min(18, len(score_df)))]
-    target_box_x1 = score_df.index[-1]
-    if np.isfinite(target_floor) and np.isfinite(target_ceiling) and target_ceiling >= target_floor:
-        fig.add_hrect(y0=target_floor, y1=target_ceiling, fillcolor='rgba(22,163,74,0.10)', line_color='rgba(22,163,74,0.55)', line_width=1, row=1, col=1)
-        fig.add_annotation(x=target_box_x1, y=target_ceiling, xref='x1', yref='y1', text=f'Target Box<br>{target_floor:,.2f} – {target_ceiling:,.2f}', showarrow=True, arrowhead=1, ax=35, ay=-25, bgcolor='rgba(236,253,243,0.95)', bordercolor='rgba(22,163,74,0.55)', font=dict(size=11, color='#065f46'), row=1, col=1)
-    if np.isfinite(support_floor):
-        fig.add_annotation(x=target_box_x1, y=support_floor, xref='x1', yref='y1', text=f'Risk Pivot<br>{support_floor:,.2f}', showarrow=True, arrowhead=1, ax=30, ay=25, bgcolor='rgba(255,247,237,0.95)', bordercolor='rgba(249,115,22,0.55)', font=dict(size=11, color='#9a3412'), row=1, col=1)
-
-    # Volume bars on secondary axis
-    fig.add_trace(go.Bar(x=score_df.index, y=score_df['Volume'], name='Volume', opacity=0.22, marker_color=volume_colors, hovertemplate='Date=%{x}<br>Volume=%{y:,.0f}<extra></extra>'), row=1, col=1, secondary_y=True)
-
-    # --- row 2: institutional score panel ---
-    fig.add_trace(go.Scatter(x=score_df.index, y=score_df['Institutional Score'], mode='lines', name='Institutional Score', line=dict(color='#111827', width=2.4), fill='tozeroy', fillcolor='rgba(17,24,39,0.08)'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=score_df.index, y=score_df['Confidence Score'], mode='lines', name='Confidence Score', line=dict(color='#7c3aed', width=2.0, dash='dot')), row=2, col=1)
-    score_bands = [(0, 25, 'rgba(220,38,38,0.08)'), (25, 40, 'rgba(249,115,22,0.08)'), (40, 60, 'rgba(245,158,11,0.08)'), (60, 75, 'rgba(132,204,22,0.08)'), (75, 100, 'rgba(22,163,74,0.08)')]
-    for y0, y1, color in score_bands:
-        fig.add_hrect(y0=y0, y1=y1, fillcolor=color, line_width=0, row=2, col=1)
-    for y in (25, 40, 60, 75):
-        fig.add_hline(y=y, line_dash='dot', line_width=1, line_color='rgba(100,116,139,0.7)', row=2, col=1)
-
-    # --- row 3: factor contribution history ---
-    factor_cols = ['Trend Score','Momentum Score','Relative Strength Score','Volume Score','Volatility Score','Risk Score','Market Regime Score']
-    factor_color_map = {'Trend Score': '#2563eb', 'Momentum Score': '#7c3aed', 'Relative Strength Score': '#14b8a6', 'Volume Score': '#f59e0b', 'Volatility Score': '#ef4444', 'Risk Score': '#64748b', 'Market Regime Score': '#16a34a'}
-    for col in factor_cols:
-        if col in score_df.columns:
-            fig.add_trace(go.Scatter(x=score_df.index, y=score_df[col], mode='lines', stackgroup='one', name=col.replace(' Score',''), line=dict(width=0.9, color=factor_color_map.get(col)), hovertemplate='Date=%{x}<br>' + col.replace(' Score','') + '=%{y:.2f}<extra></extra>'), row=3, col=1)
-
-    # --- mini performance header ---
-    score_now = float(latest.get('Institutional Score', np.nan))
-    confidence_now = float(latest.get('Confidence Score', np.nan))
-    regime_now = str(latest.get('Recommendation', 'HOLD'))
-    ret_20 = float(score_df['Close'].pct_change(20).iloc[-1] * 100) if len(score_df) > 20 and pd.notna(score_df['Close'].pct_change(20).iloc[-1]) else np.nan
-    ret_63 = float(score_df['Close'].pct_change(63).iloc[-1] * 100) if len(score_df) > 63 and pd.notna(score_df['Close'].pct_change(63).iloc[-1]) else np.nan
-    ret_252 = float(score_df['Close'].pct_change(252).iloc[-1] * 100) if len(score_df) > 252 and pd.notna(score_df['Close'].pct_change(252).iloc[-1]) else np.nan
-    avwap_now = float(anchored_vwap.dropna().iloc[-1]) if anchored_vwap.notna().any() else np.nan
-    perf_text = (
-        f"<b>Adjusted Close:</b> {latest_close:,.2f} &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>20D:</b> {ret_20:,.1f}% &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>3M:</b> {ret_63:,.1f}% &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>1Y:</b> {ret_252:,.1f}% &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>Anchored VWAP:</b> {avwap_now:,.2f} &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>Score:</b> {score_now:,.1f}/100 &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>Confidence:</b> {confidence_now:,.1f}% &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>Regime:</b> {regime_now}"
+    fig.update_layout(
+        title=dict(text=title, x=0.01, font=dict(size=17, color="#0b1f33")),
+        template="plotly_white",
+        height=850,
+        hovermode="x unified",
+        margin=dict(l=20, r=20, t=60, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1.0),
+        xaxis_rangeslider_visible=False,
     )
-    fig.add_annotation(xref='paper', yref='paper', x=0.0, y=1.11, showarrow=False, align='left', text=perf_text, font=dict(size=12, color='#111827'), bgcolor='rgba(255,255,255,0.92)', bordercolor='rgba(203,213,225,0.95)', borderwidth=1, borderpad=6)
-
-    fig.update_layout(height=1110, template='plotly_white', hovermode='x unified', margin=dict(l=20, r=20, t=100, b=20), legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1.0), xaxis_rangeslider_visible=False, bargap=0.0)
-    fig.update_xaxes(showgrid=True, gridcolor='#eef2f6')
-    fig.update_yaxes(showgrid=True, gridcolor='#eef2f6', title_text='Adjusted Price', row=1, col=1, secondary_y=False)
-    fig.update_yaxes(showgrid=False, title_text='Volume', row=1, col=1, secondary_y=True)
-    fig.update_yaxes(range=[0, 100], title_text='Score', row=2, col=1)
-    fig.update_yaxes(title_text='Points', row=3, col=1)
+    fig.update_xaxes(showgrid=True, gridcolor="#eef2f6", rangeselector=dict(buttons=[
+        dict(count=1, label="1M", step="month", stepmode="backward"),
+        dict(count=3, label="3M", step="month", stepmode="backward"),
+        dict(count=6, label="6M", step="month", stepmode="backward"),
+        dict(count=1, label="1Y", step="year", stepmode="backward"),
+        dict(step="all", label="ALL"),
+    ]), row=1, col=1)
+    fig.update_yaxes(title_text="Price / Yield", row=1, col=1, gridcolor="#eef2f6")
+    fig.update_yaxes(title_text="Volume", row=2, col=1, gridcolor="#eef2f6")
     return fig
 
-# -------------------------------------------------------------------------
+
+def build_model_frame(asset_df: pd.DataFrame, dxy_df: pd.DataFrame, tnx_df: pd.DataFrame, horizon: int) -> Tuple[pd.DataFrame, List[str], str]:
+    frame = pd.concat(
+        [
+            asset_df[["Analysis Price", "Log Return", "Momentum 5", "Momentum 20", "Momentum 60", "EWMA Vol 0.94", "ATR %", "RSI", "MACD Hist", "Volume"]].add_prefix("Asset "),
+            dxy_df[["Log Return", "Momentum 5", "Momentum 20", "Momentum 60", "EWMA Vol 0.94"]].add_prefix("DXY "),
+            yield_bp_change(tnx_df).rename("TNX bp 1D"),
+        ],
+        axis=1,
+        join="inner",
+    ).sort_index()
+
+    frame["TNX bp 5D"] = frame["TNX bp 1D"].rolling(5, min_periods=5).sum()
+    frame["TNX bp 20D"] = frame["TNX bp 1D"].rolling(20, min_periods=20).sum()
+    frame["DXY x TNX"] = frame["DXY Log Return"] * frame["TNX bp 1D"]
+    frame["Asset Volume Change 5D"] = np.log(frame["Asset Volume"].replace(0.0, np.nan) / frame["Asset Volume"].shift(5).replace(0.0, np.nan))
+    frame["DXY Corr 60"] = frame["Asset Log Return"].rolling(60, min_periods=40).corr(frame["DXY Log Return"])
+    frame["DXY Beta 60"] = frame["Asset Log Return"].rolling(60, min_periods=40).cov(frame["DXY Log Return"]) / frame["DXY Log Return"].rolling(60, min_periods=40).var().replace(0.0, np.nan)
+
+    target_col = f"Forward {horizon}D Log Return"
+    frame[target_col] = np.log(frame["Asset Analysis Price"].shift(-horizon) / frame["Asset Analysis Price"])
+    frame["Position"] = np.arange(len(frame), dtype=int)
+
+    feature_cols = [
+        "Asset Log Return",
+        "Asset Momentum 5",
+        "Asset Momentum 20",
+        "Asset Momentum 60",
+        "Asset EWMA Vol 0.94",
+        "Asset ATR %",
+        "Asset RSI",
+        "Asset MACD Hist",
+        "Asset Volume Change 5D",
+        "DXY Log Return",
+        "DXY Momentum 5",
+        "DXY Momentum 20",
+        "DXY Momentum 60",
+        "DXY EWMA Vol 0.94",
+        "TNX bp 1D",
+        "TNX bp 5D",
+        "TNX bp 20D",
+        "DXY x TNX",
+        "DXY Corr 60",
+        "DXY Beta 60",
+    ]
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    return frame, feature_cols, target_col
+
+
+def fit_scaled_ridge(X: pd.DataFrame, y: pd.Series, alpha: float) -> Tuple[StandardScaler, Ridge]:
+    """Fit a numerically stable single-thread Ridge model on contiguous float64 arrays."""
+    X_arr = np.ascontiguousarray(X.to_numpy(dtype=np.float64, copy=True))
+    y_arr = np.ascontiguousarray(y.to_numpy(dtype=np.float64, copy=True))
+    scaler = StandardScaler(copy=True)
+    with threadpool_limits(limits=1):
+        Xs = scaler.fit_transform(X_arr)
+        model = Ridge(alpha=float(alpha), solver="lsqr", tol=1e-7, max_iter=5000)
+        model.fit(Xs, y_arr)
+    return scaler, model
+
+
+def macro_regression_prediction(
+    train: pd.DataFrame,
+    row: pd.DataFrame,
+    macro_cols: List[str],
+    target_col: str,
+) -> float:
+    """Transparent DXY/UST10Y regression with bounded native-thread usage."""
+    macro_train = train.dropna(subset=macro_cols + [target_col]).tail(756)
+    if len(macro_train) < 120:
+        return float(train[target_col].tail(756).mean())
+    X_train = np.ascontiguousarray(macro_train[macro_cols].to_numpy(dtype=np.float64, copy=True))
+    y_train = np.ascontiguousarray(macro_train[target_col].to_numpy(dtype=np.float64, copy=True))
+    X_row = np.ascontiguousarray(row[macro_cols].to_numpy(dtype=np.float64, copy=True))
+    with threadpool_limits(limits=1):
+        macro_model = LinearRegression(n_jobs=1).fit(X_train, y_train)
+        prediction = macro_model.predict(X_row)
+    return float(prediction[0])
+
+
+def choose_alpha(X: pd.DataFrame, y: pd.Series, candidates: Tuple[float, ...] = (0.1, 1.0, 10.0, 100.0)) -> float:
+    if len(X) < 160:
+        return 10.0
+    split = int(len(X) * 0.80)
+    if split < 100 or len(X) - split < 30:
+        return 10.0
+    X_train, X_val = X.iloc[:split], X.iloc[split:]
+    y_train, y_val = y.iloc[:split], y.iloc[split:]
+    best_alpha = 10.0
+    best_rmse = np.inf
+    for alpha in candidates:
+        scaler, model = fit_scaled_ridge(X_train, y_train, alpha)
+        X_val_arr = np.ascontiguousarray(X_val.to_numpy(dtype=np.float64, copy=True))
+        y_val_arr = np.ascontiguousarray(y_val.to_numpy(dtype=np.float64, copy=True))
+        with threadpool_limits(limits=1):
+            pred = model.predict(scaler.transform(X_val_arr))
+        rmse = float(np.sqrt(np.mean((y_val_arr - pred) ** 2)))
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_alpha = float(alpha)
+    return best_alpha
+
+
+def walk_forward_forecast(
+    asset_df: pd.DataFrame,
+    dxy_df: pd.DataFrame,
+    tnx_df: pd.DataFrame,
+    horizon: int,
+    min_train: int = 400,
+    max_oos: int = 180,
+) -> Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame]:
+    horizon = int(horizon)
+    max_oos = int(min(max(60, max_oos), 240))
+    frame, feature_cols, target_col = build_model_frame(asset_df, dxy_df, tnx_df, horizon)
+    usable_features = frame.dropna(subset=feature_cols).copy()
+    if len(usable_features) < min_train + horizon + 30:
+        return pd.DataFrame(), {}, pd.DataFrame()
+
+    latest_pos = int(usable_features["Position"].iloc[-1])
+    realized = usable_features.dropna(subset=[target_col]).copy()
+    if len(realized) < min_train + 30:
+        return pd.DataFrame(), {}, pd.DataFrame()
+
+    candidate_positions = realized["Position"].tolist()
+    candidate_positions = candidate_positions[-max_oos:]
+    first_pred_pos = candidate_positions[0]
+    initial_train = realized[realized["Position"] <= first_pred_pos - horizon].dropna(subset=feature_cols + [target_col])
+    if len(initial_train) < min_train:
+        return pd.DataFrame(), {}, pd.DataFrame()
+
+    alpha = choose_alpha(initial_train[feature_cols], initial_train[target_col])
+    predictions = []
+
+    for pred_pos in candidate_positions:
+        row = usable_features[usable_features["Position"] == pred_pos]
+        if row.empty:
+            continue
+        train = realized[realized["Position"] <= pred_pos - horizon].dropna(subset=feature_cols + [target_col])
+        if len(train) < min_train:
+            continue
+
+        scaler, ridge = fit_scaled_ridge(train[feature_cols], train[target_col], alpha)
+        row_features = np.ascontiguousarray(row[feature_cols].to_numpy(dtype=np.float64, copy=True))
+        with threadpool_limits(limits=1):
+            ridge_pred = float(ridge.predict(scaler.transform(row_features))[0])
+
+        # Rolling macro regression: transparent DXY + yield relationship benchmark.
+        macro_cols = ["DXY Log Return", "DXY Momentum 20", "TNX bp 1D", "TNX bp 20D", "DXY x TNX"]
+        macro_pred = macro_regression_prediction(train, row, macro_cols, target_col)
+
+        hist_mean_pred = float(train[target_col].tail(756).mean())
+        actual = float(row[target_col].iloc[0])
+        predictions.append(
+            {
+                "Date": row.index[0],
+                "Position": pred_pos,
+                "Actual": actual,
+                "Ridge": ridge_pred,
+                "Macro Regression": macro_pred,
+                "Historical Mean": hist_mean_pred,
+            }
+        )
+        if len(predictions) % 30 == 0:
+            gc.collect()
+
+    pred_df = pd.DataFrame(predictions).set_index("Date") if predictions else pd.DataFrame()
+    if pred_df.empty:
+        return pred_df, {}, pd.DataFrame()
+
+    model_cols = ["Ridge", "Macro Regression", "Historical Mean"]
+    rmse_map = {}
+    for col in model_cols:
+        rmse_map[col] = float(np.sqrt(np.mean((pred_df["Actual"] - pred_df[col]) ** 2)))
+    inv = {k: 1.0 / max(v, 1e-10) for k, v in rmse_map.items()}
+    total_inv = sum(inv.values())
+    weights = {k: inv[k] / total_inv for k in model_cols}
+    pred_df["Ensemble"] = sum(pred_df[col] * weights[col] for col in model_cols)
+
+    benchmark_sse = float(np.sum((pred_df["Actual"] - pred_df["Historical Mean"]) ** 2))
+    model_sse = float(np.sum((pred_df["Actual"] - pred_df["Ensemble"]) ** 2))
+    oos_r2 = 1.0 - model_sse / benchmark_sse if benchmark_sse > 0 else np.nan
+    rmse = float(np.sqrt(np.mean((pred_df["Actual"] - pred_df["Ensemble"]) ** 2)))
+    mae = float(np.mean(np.abs(pred_df["Actual"] - pred_df["Ensemble"])))
+    hit = float((np.sign(pred_df["Actual"]) == np.sign(pred_df["Ensemble"])).mean())
+    corr = float(pred_df["Actual"].corr(pred_df["Ensemble"])) if len(pred_df) > 2 else np.nan
+    residual_std = float((pred_df["Actual"] - pred_df["Ensemble"]).std(ddof=1))
+
+    # Latest forecast: only realized targets available at least horizon days before the latest date.
+    latest_row = usable_features.iloc[[-1]]
+    latest_train = realized[realized["Position"] <= latest_pos - horizon].dropna(subset=feature_cols + [target_col])
+    if len(latest_train) < min_train:
+        return pred_df, {}, pd.DataFrame()
+
+    scaler, ridge = fit_scaled_ridge(latest_train[feature_cols], latest_train[target_col], alpha)
+    latest_features = np.ascontiguousarray(latest_row[feature_cols].to_numpy(dtype=np.float64, copy=True))
+    with threadpool_limits(limits=1):
+        latest_ridge = float(ridge.predict(scaler.transform(latest_features))[0])
+    macro_cols = ["DXY Log Return", "DXY Momentum 20", "TNX bp 1D", "TNX bp 20D", "DXY x TNX"]
+    latest_macro = macro_regression_prediction(latest_train, latest_row, macro_cols, target_col)
+    latest_mean = float(latest_train[target_col].tail(756).mean())
+    latest_ensemble = weights["Ridge"] * latest_ridge + weights["Macro Regression"] * latest_macro + weights["Historical Mean"] * latest_mean
+    positive_probability = norm_cdf(latest_ensemble / max(residual_std, 1e-10)) * 100.0
+
+    current_price = float(latest_row["Asset Analysis Price"].iloc[0])
+    lower_return = latest_ensemble - 1.96 * residual_std
+    upper_return = latest_ensemble + 1.96 * residual_std
+    summary = {
+        "Horizon": horizon,
+        "Forecast Date": latest_row.index[0],
+        "Current Price": current_price,
+        "Implied Price Target": current_price * math.exp(latest_ensemble),
+        "Lower Price Target 95%": current_price * math.exp(lower_return),
+        "Upper Price Target 95%": current_price * math.exp(upper_return),
+        "Forecast Log Return": latest_ensemble,
+        "Forecast Simple Return": math.exp(latest_ensemble) - 1.0,
+        "Positive Probability %": positive_probability,
+        "Lower 95%": lower_return,
+        "Upper 95%": upper_return,
+        "OOS R2": oos_r2,
+        "RMSE": rmse,
+        "MAE": mae,
+        "Directional Accuracy": hit,
+        "Forecast Correlation": corr,
+        "Residual Std": residual_std,
+        "Ridge Alpha": alpha,
+        "OOS Observations": int(len(pred_df)),
+        "Ridge Weight": weights["Ridge"],
+        "Macro Weight": weights["Macro Regression"],
+        "Historical Mean Weight": weights["Historical Mean"],
+    }
+
+    latest_models = pd.DataFrame(
+        {
+            "Model": ["Ridge", "Macro Regression", "Historical Mean", "Ensemble"],
+            "Forecast Log Return %": [latest_ridge * 100.0, latest_macro * 100.0, latest_mean * 100.0, latest_ensemble * 100.0],
+            "Ensemble Weight %": [weights["Ridge"] * 100.0, weights["Macro Regression"] * 100.0, weights["Historical Mean"] * 100.0, 100.0],
+        }
+    )
+    return pred_df, summary, latest_models
+
+
+def regime_snapshot(asset_df: pd.DataFrame, dxy_df: pd.DataFrame, tnx_df: pd.DataFrame) -> Dict[str, str]:
+    asset = asset_df.iloc[-1]
+    dxy = dxy_df.iloc[-1]
+    tnx_bp = yield_bp_change(tnx_df)
+    dxy_trend = "Rising USD" if dxy["Analysis Price"] > dxy["EMA 50"] else "Falling USD"
+    yield_20 = tnx_bp.rolling(20, min_periods=10).sum().iloc[-1]
+    yield_regime = "Rising Yield" if yield_20 > 0 else "Falling Yield"
+    vol_series = asset_df["EWMA Vol 0.94"].dropna()
+    if len(vol_series) >= 60:
+        percentile = float((vol_series <= vol_series.iloc[-1]).mean())
+    else:
+        percentile = 0.5
+    if percentile >= 0.70:
+        vol_regime = "High Volatility"
+    elif percentile <= 0.30:
+        vol_regime = "Low Volatility"
+    else:
+        vol_regime = "Normal Volatility"
+    trend_regime = "Positive Trend" if asset["Analysis Price"] > asset["EMA 50"] else "Negative Trend"
+    return {"DXY Regime": dxy_trend, "Yield Regime": yield_regime, "Volatility Regime": vol_regime, "Asset Trend": trend_regime}
+
+
+def summary_row(name: str, df: pd.DataFrame, dxy_df: Optional[pd.DataFrame]) -> Dict[str, object]:
+    meta = INSTRUMENTS[name]
+    price = df["Analysis Price"]
+    latest = float(price.iloc[-1])
+    is_yield = meta["type"] == "yield"
+    if is_yield:
+        ret_1d = float(price.diff().iloc[-1] * 100.0)
+        ret_1m = float(price.diff(20).iloc[-1] * 100.0) if len(price) > 20 else np.nan
+        metric_1d = ret_1d
+        metric_1m = ret_1m
+    else:
+        metric_1d = float(price.pct_change().iloc[-1] * 100.0)
+        metric_1m = float(price.pct_change(20).iloc[-1] * 100.0) if len(price) > 20 else np.nan
+    corr60 = np.nan
+    beta60 = np.nan
+    if dxy_df is not None and meta["ticker"] != DXY_TICKER:
+        relation_series = yield_bp_change(df) if meta["type"] == "yield" else df["Log Return"]
+        rel = rolling_relationship(relation_series, dxy_df["Log Return"], 60)
+        if not rel.empty:
+            corr60 = safe_float(rel["Corr 60"].iloc[-1])
+            beta60 = safe_float(rel["Beta 60"].iloc[-1])
+    return {
+        "Instrument": name,
+        "Ticker": meta["ticker"],
+        "Latest": latest,
+        "1D % / bp": metric_1d,
+        "1M % / bp": metric_1m,
+        "EWMA Vol %": safe_float(df["EWMA Vol 0.94"].iloc[-1] * 100.0),
+        "DXY Corr 60": corr60,
+        "DXY Beta 60": beta60,
+        "Last Date": df.index[-1].date(),
+    }
+
+
+# -----------------------------------------------------------------------------
 # SIDEBAR
-# -------------------------------------------------------------------------
-st.sidebar.title("SupertrendPro Institutional")
-st.sidebar.caption("Version 5.0.2 · Real Yahoo Finance daily data · No synthetic price series")
+# -----------------------------------------------------------------------------
+st.sidebar.markdown("### CommodityMacroPro")
+st.sidebar.caption("Yahoo Finance daily market data only. No synthetic series.")
+selected_name = st.sidebar.selectbox("Detailed Instrument", COMMODITY_NAMES, index=0)
+selected_ticker = INSTRUMENTS[selected_name]["ticker"]
 
-selected_category = st.sidebar.selectbox("Select Sector / Category:", list(MARKET_DATA.keys()), index=2)
-ticker_options = MARKET_DATA[selected_category]
-selected_asset_name = st.sidebar.selectbox("Select Asset:", list(ticker_options.keys()))
-ticker_symbol = ticker_options[selected_asset_name]
-
-st.sidebar.markdown("---")
-start_date = st.sidebar.date_input("Start Date", pd.to_datetime("2018-01-01"))
-end_date = st.sidebar.date_input("End Date", pd.to_datetime("today") + pd.Timedelta(days=1))
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Indicator Engine")
-_indicator_options = ["Auto — Prefer TA-Lib", "TA-Lib", "Pandas / NumPy"]
-_indicator_default = 0
-indicator_engine_mode = st.sidebar.selectbox(
-    "Calculation Engine",
-    options=_indicator_options,
-    index=_indicator_default,
-    help=(
-        "Auto uses TA-Lib when the package is installed and falls back to the internal "
-        "Pandas/NumPy formulas only when TA-Lib cannot be imported."
-    ),
-)
-
-if indicator_engine_mode == "Pandas / NumPy":
-    TALIB_AVAILABLE = False
-    ACTIVE_INDICATOR_ENGINE = "Pandas / NumPy"
-elif indicator_engine_mode == "TA-Lib":
-    TALIB_AVAILABLE = bool(TALIB_INSTALLED)
-    ACTIVE_INDICATOR_ENGINE = "TA-Lib" if TALIB_AVAILABLE else "Pandas / NumPy fallback"
-else:
-    TALIB_AVAILABLE = bool(TALIB_INSTALLED)
-    ACTIVE_INDICATOR_ENGINE = "TA-Lib" if TALIB_AVAILABLE else "Pandas / NumPy fallback"
-
-st.sidebar.caption(
-    f"Active engine: {ACTIVE_INDICATOR_ENGINE}"
-    + (f" · TA-Lib {TALIB_VERSION}" if TALIB_AVAILABLE else "")
-)
+start_date = st.sidebar.date_input("Start Date", pd.Timestamp("2010-01-01"))
+end_date = st.sidebar.date_input("End Date", pd.Timestamp.today() + pd.Timedelta(days=1))
+log_band_window = st.sidebar.selectbox("Log-Return Difference Band", [20, 60, 120], index=0)
+forecast_horizons = st.sidebar.multiselect("Forecast Horizons", [1, 5, 20, 60], default=[1, 5, 20, 60])
+max_oos = st.sidebar.slider("Walk-Forward OOS Window", min_value=60, max_value=240, value=120, step=30)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Execution Assumptions")
-transaction_cost_bps = st.sidebar.number_input("Transaction Cost (bps per side)", min_value=0.0, max_value=100.0, value=8.0, step=1.0)
-slippage_bps = st.sidebar.number_input("Slippage (bps per side)", min_value=0.0, max_value=100.0, value=4.0, step=1.0)
-st.sidebar.caption("Net strategy returns deduct costs only when position changes. No synthetic prices are used.")
+st.sidebar.caption("Methodology: Ridge shrinkage, rolling macro regression, historical-mean benchmark, inverse-RMSE forecast combination and regime diagnostics.")
+st.sidebar.caption("Cloud numerical engine: single-thread BLAS/OpenMP · shared walk-forward results · stable package pins.")
 
-use_index_filter_global = st.sidebar.checkbox("Use BIST 100 Regime Filter (XU100 > EMA200)", value=False)
-strategy_choice = st.sidebar.radio("Select Strategy Variant:", ["MACD + ATR Trailing", "Smart Supertrend", "Smart Supertrend + Optimizer"], index=1)
+# -----------------------------------------------------------------------------
+# DATA LOAD
+# -----------------------------------------------------------------------------
+with st.spinner("Retrieving daily Yahoo Finance observations..."):
+    market_data, governance = download_universe(str(start_date), str(end_date))
 
-if strategy_choice.startswith("MACD"):
-    st.sidebar.subheader("MACD + ATR Parameters")
-    atr_mult_stop_macd = st.sidebar.slider("ATR Trailing Stop Multiplier", 0.5, 6.0, 2.0, 0.5)
-    use_rsi_exit = st.sidebar.checkbox("Use RSI Exit Filter", False)
-    rsi_exit_level = st.sidebar.slider("RSI Exit Threshold", 20, 50, 30)
-    use_macd_exit = st.sidebar.checkbox("Use MACD Exit (Bear Cross)", False)
-    use_ema_macd = st.sidebar.checkbox("Use EMA200 Filter (Entry)", False)
-    use_adx_macd = st.sidebar.checkbox("Use ADX Filter (Entry)", False)
-    adx_threshold_macd = st.sidebar.slider("ADX Threshold (MACD)", 5, 40, 10)
-    macd_fast = st.sidebar.slider("MACD Fast Period", 5, 20, 8, 1)
-    macd_slow = st.sidebar.slider("MACD Slow Period", 10, 40, 21, 1)
-    macd_signal = st.sidebar.slider("MACD Signal Period", 5, 20, 9, 1)
-else:
-    st.sidebar.subheader("Smart Supertrend Parameters")
-    st_period = st.sidebar.slider("Supertrend Period", 7, 50, 10)
-    st_mult = st.sidebar.slider("Supertrend Multiplier", 1.0, 6.0, 2.5, 0.5)
-    use_adx_filter = st.sidebar.checkbox("Use ADX Filter", False)
-    adx_threshold = st.sidebar.slider("ADX Threshold", 5, 40, 10)
-    use_ema_filter = st.sidebar.checkbox("Use EMA200 Filter (Entry)", False)
-    atr_mult_stop_st = st.sidebar.slider("ATR Trailing Stop Multiplier", 0.5, 6.0, 2.0, 0.5)
+required_tickers = [selected_ticker, DXY_TICKER, TNX_TICKER]
+missing_required = [t for t in required_tickers if t not in market_data]
+if missing_required:
+    st.error("Required Yahoo Finance series could not be loaded: " + ", ".join(missing_required))
+    st.dataframe(governance, width="stretch", hide_index=True)
+    st.stop()
 
-# -------------------------------------------------------------------------
-# MAIN DATA LOAD
-# -------------------------------------------------------------------------
+selected_df = market_data[selected_ticker]
+dxy_df = market_data[DXY_TICKER]
+tnx_df = market_data[TNX_TICKER]
+
+if len(selected_df) < 500:
+    st.warning("The selected instrument has fewer than 500 daily observations. Forecast validation may be unavailable or less stable.")
+
+# -----------------------------------------------------------------------------
+# HEADER
+# -----------------------------------------------------------------------------
 st.markdown(
-    """
+    f"""
     <div class="hf-masthead">
-      <div class="hf-eyebrow">MK FinTECH LabGEN · Institutional Analytics</div>
-      <div class="hf-brand-row">
-        <div class="hf-title">SupertrendPro Institutional</div>
-        <div class="hf-version">Version 5.0.2</div>
-      </div>
-      <div class="hf-meta">Trend · Risk · Diagnostics · Leading Signal Engine · No Synthetic Data</div>
+      <div class="hf-eyebrow">MK FinTECH LabGEN · Institutional Commodity & Macro Analytics</div>
+      <div><span class="hf-title">{APP_NAME}</span><span class="hf-version">Version {APP_VERSION}</span></div>
+      <div class="hf-meta">Daily commodities · DXY transmission · UST 10Y yield channel · EWMA risk · Walk-forward predictive analytics</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
-st.caption("Yahoo Finance daily OHLCV · Net-of-cost backtests · Educational analytics, not investment advice")
-
-engine_col1, engine_col2, engine_col3 = st.columns(3)
-engine_col1.metric("Market Data Engine", "Yahoo Finance")
-engine_col2.metric("Indicator Engine", ACTIVE_INDICATOR_ENGINE)
-engine_col3.metric("TA-Lib Version", TALIB_VERSION if TALIB_INSTALLED else "Unavailable")
-
-if indicator_engine_mode == "TA-Lib" and not TALIB_INSTALLED:
-    st.warning(
-        "TA-Lib was explicitly selected but could not be imported. "
-        "The app has switched to its internal Pandas/NumPy indicator formulas. "
-        f"Import detail: {TALIB_IMPORT_ERROR or 'unknown error'}"
-    )
-elif indicator_engine_mode.startswith("Auto") and TALIB_INSTALLED:
-    st.success(f"TA-Lib {TALIB_VERSION} is active for supported indicators. Pandas/NumPy remains available as a fallback.")
-elif indicator_engine_mode.startswith("Auto") and not TALIB_INSTALLED:
-    st.info(
-        "TA-Lib is not available in this deployment, so Auto mode selected the internal "
-        "Pandas/NumPy engine. Add TA-Lib to requirements.txt and reboot the app to activate it."
-    )
-else:
-    st.info("Pandas/NumPy indicator calculations were selected manually. Price data still comes only from Yahoo Finance.")
-
-with st.spinner("Fetching XU100 benchmark for regime filter and beta calculations..."):
-    idx_raw = get_data(BENCHMARK_SYMBOL, start_date, end_date)
-idx_ind, index_returns, index_regime = None, None, None
-if idx_raw is not None and len(idx_raw) > 260:
-    idx_ind = compute_indicators(idx_raw)
-    index_returns = idx_ind["Close"].pct_change().fillna(0.0)
-    index_regime = idx_ind["Close"] > idx_ind["EMA_200"]
-else:
-    st.warning("XU100 benchmark data is unavailable or insufficient. Beta, alpha and regime filter may be disabled.")
-    use_index_filter_global = False
-
-with st.spinner(f"Fetching real Yahoo data for {selected_asset_name} ({ticker_symbol})..."):
-    data_raw = get_data(ticker_symbol, start_date, end_date)
-if data_raw is None or len(data_raw) < 260:
-    st.error(f"Insufficient Yahoo Finance data for {selected_asset_name} ({ticker_symbol}). No synthetic fallback is used.")
-    st.stop()
-
-data = compute_indicators(data_raw)
-if strategy_choice.startswith("MACD"):
-    plot_data, trades_df, stats = backtest_macd_atr_trailing(
-        data, start_date=start_date,
-        atr_mult_stop=atr_mult_stop_macd,
-        use_rsi_exit=use_rsi_exit,
-        rsi_exit_level=rsi_exit_level,
-        use_ema_filter=use_ema_macd,
-        use_adx_filter=use_adx_macd,
-        adx_threshold=adx_threshold_macd,
-        use_macd_exit=use_macd_exit,
-        fastperiod=macd_fast,
-        slowperiod=macd_slow,
-        signalperiod=macd_signal,
-        market_filter=index_regime if use_index_filter_global else None,
-        index_returns=index_returns,
-        transaction_cost_bps=transaction_cost_bps,
-        slippage_bps=slippage_bps,
-    )
-else:
-    plot_data, trades_df, stats = backtest_supertrend_trailing(
-        data, start_date=start_date,
-        st_period=st_period,
-        st_mult=st_mult,
-        use_adx_filter=use_adx_filter,
-        adx_threshold=adx_threshold,
-        use_ema_filter=use_ema_filter,
-        atr_mult_stop=atr_mult_stop_st,
-        market_filter=index_regime if use_index_filter_global else None,
-        index_returns=index_returns,
-        transaction_cost_bps=transaction_cost_bps,
-        slippage_bps=slippage_bps,
-    )
-
-last = plot_data.iloc[-1]
-trend_state = "BULLISH" if last["Close"] > last["EMA_200"] else "BEARISH"
-tech_score, tech_reasons = technical_grade(last)
 
 st.markdown(
     f"""
     <div class="instrument-header">
-      <div class="instrument-kicker">Selected Instrument</div>
-      <div class="instrument-title">{selected_asset_name}<span>{ticker_symbol}</span></div>
-      <div class="instrument-subtitle">Institutional technical, risk, backtest and decision analytics</div>
+      <div class="instrument-kicker">Selected Research Instrument</div>
+      <div class="instrument-title">{selected_name}<span>{selected_ticker}</span></div>
+      <div class="instrument-subtitle">Yahoo Finance daily data · {selected_df.index.min().date()} to {selected_df.index.max().date()} · {len(selected_df):,} valid observations</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
-st.caption("Version 5.0.2 · Strategy diagnostics · Leading signal lab · Cloud-stable deployment")
 
-# Top KPIs
-k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("Last Price", f"₺{last['Close']:.2f}")
-k2.metric("RSI", f"{last['RSI']:.1f}")
-k3.metric("Trend vs EMA200", trend_state)
-k4.metric("Strategy Return", f"{stats.get('strat_total_pct', np.nan):.1f}%")
-k5.metric("Strategy MaxDD", f"{stats.get('strat_mdd_pct', np.nan):.1f}%")
-k6.metric("Technical Score", f"{tech_score:.0f}/100")
+# -----------------------------------------------------------------------------
+# PRECOMPUTED SNAPSHOTS
+# -----------------------------------------------------------------------------
+regime = regime_snapshot(selected_df, dxy_df, tnx_df)
+relationship_60 = rolling_relationship(selected_df["Log Return"], dxy_df["Log Return"], 60)
+latest_corr60 = safe_float(relationship_60["Corr 60"].iloc[-1]) if not relationship_60.empty else np.nan
+latest_beta60 = safe_float(relationship_60["Beta 60"].iloc[-1]) if not relationship_60.empty else np.nan
+last_price = float(selected_df["Analysis Price"].iloc[-1])
+ret_1d = float(selected_df["Analysis Price"].pct_change().iloc[-1] * 100.0)
+ret_20d = float(selected_df["Analysis Price"].pct_change(20).iloc[-1] * 100.0) if len(selected_df) > 20 else np.nan
+vol_latest = float(selected_df["EWMA Vol 0.94"].iloc[-1] * 100.0)
 
-st.markdown("---")
+kpi_cols = st.columns(8)
+kpi_cols[0].metric("Latest Price", fmt_number(last_price, 2))
+kpi_cols[1].metric("1D Return", fmt_number(ret_1d, 2, "%"))
+kpi_cols[2].metric("20D Return", fmt_number(ret_20d, 2, "%"))
+kpi_cols[3].metric("EWMA Vol", fmt_number(vol_latest, 2, "%"))
+kpi_cols[4].metric("DXY Corr 60D", fmt_number(latest_corr60, 3))
+kpi_cols[5].metric("DXY Beta 60D", fmt_number(latest_beta60, 3))
+kpi_cols[6].metric("DXY Regime", regime["DXY Regime"])
+kpi_cols[7].metric("Risk Regime", regime["Volatility Regime"])
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    "Strategy & Signal",
-    "Market Data",
-    "Technical Analytics",
-    "Backtest & Risk",
-    "Strategy Diagnostics",
-    "Blue-Chip Screener",
-    "Capital Gain Leaders",
-    "Portfolio Lab",
-    "Leading Signal Lab",
-    "Institutional Decision Engine",
-])
+# -----------------------------------------------------------------------------
+# SHARED FORECAST RESULTS — COMPUTED ONCE PER RERUN
+# -----------------------------------------------------------------------------
+forecast_results: Dict[int, Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame]] = {}
+if forecast_horizons:
+    with st.spinner("Running single-pass walk-forward forecasts..."):
+        for _h in sorted(set(int(x) for x in forecast_horizons)):
+            forecast_results[_h] = walk_forward_forecast(
+                selected_df, dxy_df, tnx_df, _h, min_train=400, max_oos=max_oos
+            )
+    gc.collect()
 
-# -------------------------------------------------------------------------
-# TAB 1
-# -------------------------------------------------------------------------
-with tab1:
-    st.plotly_chart(strategy_chart(plot_data, f"{selected_asset_name} ({ticker_symbol}) — {strategy_choice}"), width="stretch", theme=None)
-    st.markdown(f"<div class='ok-note'><b>Signal Drivers:</b> {tech_reasons or 'No strong technical driver detected.'}</div>", unsafe_allow_html=True)
-
-# -------------------------------------------------------------------------
-# TAB 2
-# -------------------------------------------------------------------------
-with tab2:
-    st.subheader("Market Data — OHLCV, Signals, Risk & Rolling Beta")
-    cols = ["Open", "High", "Low", "Close", "Volume", "RSI", "EMA_50", "EMA_200", "MACD", "MACD_SIGNAL", "ATR_Pct", "ADX", "ST_Dir", "Filter_Trend_Pass", "Filter_EMA200_Pass", "Filter_ADX_Pass", "Filter_Market_Pass", "Entry_Eligible", "Exit_Rule", "Signal", "Position", "ATR_Stop", "Return", "Gross_Strategy_Return", "Trading_Cost", "Turnover", "Strategy_Return", "Rolling_Beta_Asset", "Rolling_Beta_Strategy", "Drawdown"]
-    show = plot_data[[c for c in cols if c in plot_data.columns]].sort_index(ascending=False).copy()
-    st.dataframe(style_smart_table(show.head(800)), width="stretch", height=620)
-    csv = show.to_csv(index=True).encode("utf-8")
-    st.download_button("Download current asset table as CSV", csv, file_name=f"{ticker_symbol.replace('.','_')}_smart_table.csv", mime="text/csv")
-    if not trades_df.empty:
-        st.subheader("Trade Log")
-        st.dataframe(style_smart_table(trades_df.sort_values("EntryDate", ascending=False)), width="stretch")
-
-# -------------------------------------------------------------------------
-# TAB 3
-# -------------------------------------------------------------------------
-with tab3:
-    st.subheader("Technical Analytics — Candlestick, Bollinger Bands, Supertrend, RSI and MACD")
-    ts = plot_data.copy()
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.58, 0.22, 0.20], subplot_titles=("Candlestick + Bollinger + EMA + Supertrend", "MACD", "RSI"))
-    fig.add_trace(go.Candlestick(x=ts.index, open=ts["Open"], high=ts["High"], low=ts["Low"], close=ts["Close"], name="OHLC"), row=1, col=1)
-    for c, n, dash in [("BB_UPPER", "BB Upper", "dash"), ("BB_MID", "BB Mid", "dot"), ("BB_LOWER", "BB Lower", "dash"), ("EMA_50", "EMA50", "dot"), ("EMA_200", "EMA200", "solid"), ("ST_Line", "Supertrend", "solid")]:
-        if c in ts.columns:
-            fig.add_trace(go.Scatter(x=ts.index, y=ts[c], name=n, mode="lines", line=dict(width=1.1, dash=dash)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=ts.index, y=ts["MACD"], name="MACD", mode="lines"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=ts.index, y=ts["MACD_SIGNAL"], name="Signal", mode="lines", line=dict(dash="dot")), row=2, col=1)
-    fig.add_trace(go.Bar(x=ts.index, y=ts["MACD_HIST"], name="Hist"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=ts.index, y=ts["RSI"], name="RSI", mode="lines"), row=3, col=1)
-    fig.add_hrect(y0=70, y1=100, opacity=0.08, line_width=0, row=3, col=1)
-    fig.add_hrect(y0=0, y1=30, opacity=0.08, line_width=0, row=3, col=1)
-    st.plotly_chart(clean_fig(fig, height=900), width="stretch", theme=None)
-
-# -------------------------------------------------------------------------
-# TAB 4
-# -------------------------------------------------------------------------
-with tab4:
-    st.subheader("Backtest, Beta and Institutional Risk Metrics")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Strategy CAGR", f"{stats.get('strat_annual_pct', np.nan):.2f}%")
-    c2.metric("Sharpe / Sortino", f"{stats.get('sharpe', np.nan):.2f} / {stats.get('sortino', np.nan):.2f}")
-    c3.metric("Beta vs XU100", f"{stats.get('beta_strategy', np.nan):.2f}")
-    c4.metric("IR / TE", f"{stats.get('information_ratio', np.nan):.2f} / {stats.get('tracking_error_pct', np.nan):.1f}%")
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("VaR 95% / CVaR 95%", f"{stats.get('var95_pct', np.nan):.2f}% / {stats.get('cvar95_pct', np.nan):.2f}%")
-    c6.metric("VaR 99% / CVaR 99%", f"{stats.get('var99_pct', np.nan):.2f}% / {stats.get('cvar99_pct', np.nan):.2f}%")
-    c7.metric("Up / Down Capture", f"{stats.get('up_capture_pct', np.nan):.1f}% / {stats.get('down_capture_pct', np.nan):.1f}%")
-    c8.metric("Win Rate / Closed Trades", f"{stats.get('win_rate', np.nan):.1f}% / {stats.get('trade_count', 0)}")
-
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Exposure", f"{stats.get('exposure_pct', np.nan):.1f}%")
-    d2.metric("Buy / Sell Signals", f"{stats.get('buy_signal_count', 0)} / {stats.get('sell_signal_count', 0)}")
-    d3.metric("Entry-Eligible Days", f"{stats.get('entry_eligible_days', 0)}")
-    d4.metric("Open Position Now", "YES" if stats.get('active_position_now', False) else "NO")
-
-    e1, e2, e3, e4 = st.columns(4)
-    e1.metric("Omega Ratio", f"{stats.get('omega', np.nan):.2f}")
-    e2.metric("Ulcer Index", f"{stats.get('ulcer_index', np.nan):.2f}")
-    e3.metric("Longest Drawdown", f"{stats.get('longest_dd_days', np.nan):.0f} days")
-    total_cost_pct = plot_data.get("Trading_Cost", pd.Series(0.0, index=plot_data.index)).sum() * 100
-    e4.metric("Cumulative Trading Costs", f"{total_cost_pct:.2f}%")
-
-    benchmark_aligned_obs = int(index_returns.reindex(plot_data.index).notna().sum()) if index_returns is not None else 0
-    diagnostic_rows = [
-        {"Check": "Valid observations", "Value": f"{len(plot_data):,}", "Status": "PASS" if len(plot_data) >= 120 else "REVIEW"},
-        {"Check": "Entry-eligible days", "Value": f"{int(stats.get('entry_eligible_days', 0)):,}", "Status": "PASS" if stats.get('entry_eligible_days', 0) > 0 else "FAIL"},
-        {"Check": "Buy signals", "Value": f"{int(stats.get('buy_signal_count', 0)):,}", "Status": "PASS" if stats.get('buy_signal_count', 0) > 0 else "FAIL"},
-        {"Check": "Market exposure", "Value": f"{stats.get('exposure_pct', np.nan):.1f}%", "Status": "PASS" if stats.get('exposure_pct', 0) > 0 else "FAIL"},
-        {"Check": "Non-zero net returns", "Value": f"{int((plot_data['Strategy_Return'].abs() > 1e-12).sum()):,}", "Status": "PASS" if (plot_data['Strategy_Return'].abs() > 1e-12).any() else "FAIL"},
-        {"Check": "Benchmark alignment", "Value": f"{benchmark_aligned_obs:,}", "Status": "PASS" if benchmark_aligned_obs >= 60 else "REVIEW"},
+# -----------------------------------------------------------------------------
+# TABS
+# -----------------------------------------------------------------------------
+tabs = st.tabs(
+    [
+        "Executive Dashboard",
+        "Smart Price Structure",
+        "EWMA Volatility",
+        "DXY Relationship",
+        "Forecast Laboratory",
+        "Log Return Difference ±2σ",
+        "Cross-Asset Matrix",
+        "Model Validation",
+        "Data Governance",
     ]
-    st.markdown("#### Strategy Execution Audit")
-    st.dataframe(pd.DataFrame(diagnostic_rows), width="stretch", hide_index=True)
+)
 
-    if stats.get('buy_signal_count', 0) == 0 and stats.get('entry_eligible_days', 0) == 0:
-        st.warning("Strategy produced no eligible entry days under the current filters. Try disabling EMA200, ADX, or BIST100 regime filter, or use a longer backtest window.")
-    elif stats.get('trade_count', 0) == 0 and stats.get('active_position_now', False):
-        st.info("The strategy is active but has not closed a trade yet in the selected window. Closed-trade statistics will remain zero until an exit occurs.")
-
-    st.plotly_chart(equity_risk_chart(plot_data), width="stretch", theme=None)
-
-    risk_table = pd.DataFrame([compute_return_metrics(plot_data["Return"], index_returns, "Buy & Hold"), compute_return_metrics(plot_data["Strategy_Return"], index_returns, "Strategy")])
-    st.dataframe(style_smart_table(risk_table), width="stretch")
-
-    if strategy_choice == "Smart Supertrend + Optimizer":
-        st.markdown("---")
-        st.subheader("Smart Supertrend Recent-Window Optimization")
-        opt_window = st.slider("Optimization Window Days", 90, 540, 180, 30)
-        if st.button("Run Optimization Grid"):
-            rows = []
-            combos = list(itertools.product([7, 10, 14, 20, 30], [1.5, 2.0, 2.5, 3.0, 4.0], [5, 10, 15, 20]))
-            prog = st.progress(0.0)
-            opt_start = plot_data.index[-1] - pd.Timedelta(days=opt_window)
-            for i, (per, mult, adx_th) in enumerate(combos):
-                bt, tr, stt = backtest_supertrend_trailing(data, opt_start, per, mult, True, adx_th, use_ema_filter, atr_mult_stop_st, index_regime if use_index_filter_global else None, index_returns)
-                rows.append({"Period": per, "Multiplier": mult, "ADX": adx_th, "Return %": stt.get("strat_total_pct", np.nan), "Sharpe": stt.get("sharpe", np.nan), "MaxDD %": stt.get("strat_mdd_pct", np.nan), "Trades": stt.get("trade_count", 0)})
-                prog.progress((i + 1) / len(combos))
-            prog.empty()
-            opt_df = pd.DataFrame(rows).sort_values(["Sharpe", "Return %"], ascending=False)
-            st.dataframe(style_smart_table(opt_df.head(30)), width="stretch")
-            pivot = opt_df[opt_df["ADX"] == opt_df.iloc[0]["ADX"]].pivot_table(index="Period", columns="Multiplier", values="Return %", aggfunc="mean")
-            st.plotly_chart(clean_fig(go.Figure(data=go.Heatmap(z=pivot.values, x=pivot.columns, y=pivot.index, colorbar=dict(title="Return %"))).update_layout(title="Return Heatmap for Best ADX Bucket"), height=500), width="stretch")
-
-# -------------------------------------------------------------------------
-# TAB 5: STRATEGY DIAGNOSTICS
-# -------------------------------------------------------------------------
-with tab5:
-    st.subheader("Strategy Diagnostics — Filter Constraint Analysis")
-    st.caption("Every row is calculated from real Yahoo Finance observations. Disabled filters are treated as PASS and are clearly labelled below.")
-
-    diagnostic_columns = [
-        "Filter_Trend_Pass", "Filter_EMA200_Pass", "Filter_ADX_Pass",
-        "Filter_Market_Pass", "Entry_Eligible"
-    ]
-    diag_df = plot_data[[c for c in diagnostic_columns if c in plot_data.columns]].copy()
-    total_obs = max(len(diag_df), 1)
-    labels = {
-        "Filter_Trend_Pass": "Trend condition passed",
-        "Filter_EMA200_Pass": "EMA200 filter passed",
-        "Filter_ADX_Pass": "ADX filter passed",
-        "Filter_Market_Pass": "BIST100 regime passed",
-        "Entry_Eligible": "FINAL ENTRY ELIGIBLE",
-    }
-    active_flags = {
-        "Filter_Trend_Pass": True,
-        "Filter_EMA200_Pass": bool(use_ema_macd) if strategy_choice.startswith("MACD") else bool(use_ema_filter),
-        "Filter_ADX_Pass": bool(use_adx_macd) if strategy_choice.startswith("MACD") else bool(use_adx_filter),
-        "Filter_Market_Pass": bool(use_index_filter_global),
-        "Entry_Eligible": True,
-    }
+# 1) EXECUTIVE DASHBOARD
+with tabs[0]:
+    st.subheader("Cross-Market Executive Dashboard")
+    st.markdown('<div class="section-note">A consolidated view of commodity prices, DXY sensitivity and current risk state. Yield moves are expressed in basis points; price instruments use percentage returns.</div>', unsafe_allow_html=True)
     rows = []
-    for col in diagnostic_columns:
-        if col not in diag_df.columns:
-            continue
-        passed = int(diag_df[col].fillna(False).astype(bool).sum())
-        rows.append({
-            "Constraint": labels[col],
-            "Filter status": "ACTIVE" if active_flags[col] else "OFF (not restrictive)",
-            "Days passed": passed,
-            "Pass rate %": passed / total_obs * 100,
-            "Days blocked": total_obs - passed,
-        })
-    constraint_table = pd.DataFrame(rows)
-    st.dataframe(
-        constraint_table.style.format({"Pass rate %": "{:.2f}%"}),
-        width="stretch",
-        hide_index=True,
-    )
-
-    if not constraint_table.empty:
-        fig_diag = go.Figure(go.Bar(
-            x=constraint_table["Days passed"],
-            y=constraint_table["Constraint"],
-            orientation="h",
-            text=constraint_table["Pass rate %"].map(lambda x: f"{x:.1f}%"),
-            textposition="auto",
-        ))
-        fig_diag.update_layout(
-            title="Filter Funnel — Number of Trading Days Passing Each Condition",
-            template="plotly_white", height=430,
-            xaxis_title="Trading days passed", yaxis_title="",
-            margin=dict(l=20, r=20, t=60, b=20),
-        )
-        st.plotly_chart(fig_diag, width="stretch", theme=None)
-
-    st.markdown("#### Daily decision audit")
-    audit_cols = [
-        "Close", "EMA_200", "ADX", "ST_Dir", "MACD", "MACD_SIGNAL",
-        "Filter_Trend_Pass", "Filter_EMA200_Pass", "Filter_ADX_Pass",
-        "Filter_Market_Pass", "Entry_Eligible", "Signal", "Position"
-    ]
-    audit = plot_data[[c for c in audit_cols if c in plot_data.columns]].sort_index(ascending=False).head(500)
-    st.dataframe(style_smart_table(audit), width="stretch", height=600)
-
-    eligible = int(plot_data.get("Entry_Eligible", pd.Series(False, index=plot_data.index)).sum())
-    if eligible == 0:
-        st.error("FINAL ENTRY ELIGIBLE = 0. At least one active filter blocks every possible entry day. Compare the pass rates above and disable or relax the smallest active pass-rate filter first.")
-    else:
-        st.success(f"FINAL ENTRY ELIGIBLE = {eligible} trading days ({eligible / total_obs * 100:.2f}% of the test sample).")
-
-# -------------------------------------------------------------------------
-# TAB 5: BLUE-CHIP UNIVERSE SCREENER
-# -------------------------------------------------------------------------
-with tab6:
-    st.subheader("BIST Blue-Chip Universe Screener")
-    st.markdown("<div class='small-note'>Universe includes banks, QNB, Garanti, YKBNK, Koç Holding, Sabancı Holding, Pegasus, industrials, telecom, consumer and energy names. Calculations use real Yahoo daily data only.</div>", unsafe_allow_html=True)
-    col_a, col_b, col_c = st.columns(3)
-    min_obs_scan = col_a.slider("Minimum valid observations", 60, 756, 180, 30, key="blue_min_obs")
-    selected_groups = col_b.multiselect("Universe Groups", [k for k in MARKET_DATA.keys() if k != "Indices"], default=["Major Banks & Financials", "Holdings & Conglomerates", "Transport, Aviation & Tourism", "Industrial Blue Chips"])
-    scan_limit = col_c.slider("Max names to show", 10, 100, 40, 5)
-
-    selected_map = {}
-    for group in selected_groups:
-        selected_map.update(MARKET_DATA[group])
-
-    if st.button("Run Blue-Chip Universe Scan"):
-        with st.spinner("Scanning selected BIST universe with real Yahoo data..."):
-            scan_df, excluded_df, data_map = run_universe_scan(selected_map, start_date, end_date, index_returns, min_obs=min_obs_scan)
-            scan_df = smart_score_table(scan_df)
-            st.session_state["blue_scan_df"] = scan_df
-            st.session_state["blue_excluded_df"] = excluded_df
-            st.session_state["blue_data_symbols"] = list(data_map.keys())
-
-    scan_df = st.session_state.get("blue_scan_df", pd.DataFrame())
-    if scan_df is not None and not scan_df.empty:
-        st.success(f"Scan complete: {len(scan_df)} valid names. Excluded names are listed below, if any.")
-        show_cols = ["Name", "Symbol", "Action Lens", "Composite Score", "Technical Score", "Last Close", "RSI", "ADX", "3M Momentum %", "6M Momentum %", "CAGR %", "Ann Vol %", "Sharpe", "Max Drawdown %", "Beta vs XU100", "Avg Daily TL Volume", "Signal Drivers"]
-        st.dataframe(style_smart_table(scan_df[[c for c in show_cols if c in scan_df.columns]].head(scan_limit)), width="stretch", height=620)
-        st.plotly_chart(risk_return_bubble(scan_df, "Blue-Chip Risk / Return / Liquidity Map"), width="stretch", theme=None)
-        st.plotly_chart(momentum_bar(scan_df, "Top Blue-Chip Momentum Profile", n=min(20, len(scan_df))), width="stretch", theme=None)
-        st.download_button("Download blue-chip screener CSV", scan_df.to_csv(index=False).encode("utf-8"), "bist_blue_chip_screener.csv", "text/csv")
-    excluded_df = st.session_state.get("blue_excluded_df", pd.DataFrame())
-    if excluded_df is not None and not excluded_df.empty:
-        with st.expander("Data Quality / Exclusion Log"):
-            st.dataframe(excluded_df, width="stretch")
-
-# -------------------------------------------------------------------------
-# TAB 6: CAPITAL GAIN LEADERS LAB
-# -------------------------------------------------------------------------
-with tab7:
-    st.subheader("Capital Gain Leaders — High-Momentum Basket")
-    st.markdown("<div class='risk-note'><b>No synthetic data rule:</b> the snapshot gain table is only a user-provided watchlist/metadata layer. All prices, returns, beta, volatility and signals below are recalculated from real Yahoo Finance OHLCV. If Yahoo data is missing, the stock is excluded and logged.</div>", unsafe_allow_html=True)
-    cap_meta = pd.DataFrame(CAPITAL_GAIN_LEADERS)
-    st.markdown("#### User-Provided Snapshot Watchlist")
-    st.dataframe(style_smart_table(cap_meta), width="stretch", height=320)
-
-    col1, col2, col3 = st.columns(3)
-    min_obs_cap = col1.slider("Minimum valid observations", 40, 756, 120, 20, key="cap_min_obs")
-    cap_top_n = col2.slider("Top N rows", 5, 40, 30, 5, key="cap_topn")
-    rank_basis = col3.selectbox("Sort by", ["Composite Score", "3M Momentum %", "6M Momentum %", "Sharpe", "Technical Score", "SnapshotGainPct"], index=0)
-
-    if st.button("Run Capital Gain Leaders Scan"):
-        cap_map = {row["Name"]: row["Symbol"] for row in CAPITAL_GAIN_LEADERS}
-        with st.spinner("Scanning capital gain leaders using real Yahoo data..."):
-            cap_df, cap_excl, cap_data_map = run_universe_scan(cap_map, start_date, end_date, index_returns, min_obs=min_obs_cap)
-            cap_df = smart_score_table(cap_df)
-            if not cap_df.empty:
-                cap_df = cap_df.merge(cap_meta[["Symbol", "SnapshotPrice", "SnapshotGainPct", "SnapshotTarget", "Rating"]], on="Symbol", how="left")
-                if rank_basis in cap_df.columns:
-                    cap_df = cap_df.sort_values(rank_basis, ascending=False)
-            st.session_state["cap_df"] = cap_df
-            st.session_state["cap_excl"] = cap_excl
-            st.session_state["cap_data_symbols"] = list(cap_data_map.keys())
-
-    cap_df = st.session_state.get("cap_df", pd.DataFrame())
-    if cap_df is not None and not cap_df.empty:
-        show_cols = ["Name", "Symbol", "Action Lens", "Composite Score", "SnapshotGainPct", "SnapshotTarget", "Rating", "Last Close", "RSI", "ADX", "3M Momentum %", "6M Momentum %", "1Y Momentum %", "From 52W High %", "ATR %", "Ann Vol %", "Sharpe", "Max Drawdown %", "Beta vs XU100", "VaR 95% %", "Avg Daily TL Volume", "Signal Drivers"]
-        st.markdown("#### Capital Gain Leaders — Smart Ranking")
-        st.dataframe(style_smart_table(cap_df[[c for c in show_cols if c in cap_df.columns]].head(cap_top_n)), width="stretch", height=650)
-        c1, c2, c3 = st.columns(3)
-        top = cap_df.iloc[0]
-        c1.metric("Top Composite", f"{top['Name']} ({top['Symbol']})", f"{top['Composite Score']:.1f}")
-        c2.metric("Best 3M Momentum", f"{cap_df.sort_values('3M Momentum %', ascending=False).iloc[0]['Symbol']}", f"{cap_df['3M Momentum %'].max():.1f}%")
-        c3.metric("Highest Risk Vol", f"{cap_df.sort_values('Ann Vol %', ascending=False).iloc[0]['Symbol']}", f"{cap_df['Ann Vol %'].max():.1f}%")
-        st.plotly_chart(risk_return_bubble(cap_df, "Capital Gain Leaders — Risk / Return / Liquidity Map"), width="stretch", theme=None)
-        st.plotly_chart(momentum_bar(cap_df, "Capital Gain Leaders — Momentum Comparison", n=min(25, len(cap_df))), width="stretch", theme=None)
-        st.download_button("Download capital gain leaders CSV", cap_df.to_csv(index=False).encode("utf-8"), "bist_capital_gain_leaders_scan.csv", "text/csv")
-    cap_excl = st.session_state.get("cap_excl", pd.DataFrame())
-    if cap_excl is not None and not cap_excl.empty:
-        with st.expander("Capital Gain Leaders — Exclusion Log"):
-            st.dataframe(cap_excl, width="stretch")
-
-# -------------------------------------------------------------------------
-# TAB 7: MINI PORTFOLIO LAB
-# -------------------------------------------------------------------------
-with tab8:
-    st.subheader("Equal-Weight Portfolio Lab vs XU100")
-    source_choice = st.radio("Choose selection source", ["Manual Universe", "Top Blue-Chip Scan", "Top Capital Gain Leaders"], horizontal=True)
-    if source_choice == "Manual Universe":
-        all_names = list(UNIVERSE_STOCKS.keys())
-        default_names = ["Akbank", "Garanti BBVA", "Yapi Kredi", "Koc Holding", "Sabanci Holding", "Pegasus Airlines", "Turkish Airlines", "Ford Otosan"]
-        chosen_names = st.multiselect("Select stocks", all_names, default=[x for x in default_names if x in all_names])
-        chosen_symbols = [UNIVERSE_STOCKS[n] for n in chosen_names]
-    elif source_choice == "Top Blue-Chip Scan":
-        scan_df = st.session_state.get("blue_scan_df", pd.DataFrame())
-        if scan_df.empty:
-            st.warning("Run the Blue-Chip Universe Scan first, or switch to Manual Universe.")
-            chosen_symbols = []
-        else:
-            topn = st.slider("Top N from blue-chip scan", 3, min(20, len(scan_df)), min(8, len(scan_df)))
-            chosen_symbols = scan_df.head(topn)["Symbol"].tolist()
-            st.write(chosen_symbols)
-    else:
-        cap_df = st.session_state.get("cap_df", pd.DataFrame())
-        if cap_df.empty:
-            st.warning("Run the Capital Gain Leaders Scan first, or switch to Manual Universe.")
-            chosen_symbols = []
-        else:
-            topn = st.slider("Top N from capital gain leaders", 3, min(20, len(cap_df)), min(8, len(cap_df)), key="cap_port_topn")
-            chosen_symbols = cap_df.head(topn)["Symbol"].tolist()
-            st.write(chosen_symbols)
-
-    if st.button("Run Equal-Weight Portfolio Backtest"):
-        with st.spinner("Building equal-weight portfolio from real Yahoo data..."):
-            portfolio = run_equal_weight_portfolio(chosen_symbols, start_date, end_date, idx_ind=idx_ind, min_len=MIN_PRICE_OBS)
-            st.session_state["portfolio_result"] = portfolio
-
-    portfolio = st.session_state.get("portfolio_result", None)
-    if portfolio is not None:
-        if portfolio is None:
-            st.error("Portfolio could not be created. Too few valid Yahoo Finance histories.")
-        else:
-            pmet = portfolio["metrics_port"]
-            imet = portfolio.get("metrics_index", {})
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Portfolio CAGR", f"{pmet.get('CAGR %', np.nan):.2f}%")
-            c2.metric("Portfolio Vol", f"{pmet.get('Ann Vol %', np.nan):.2f}%")
-            c3.metric("Sharpe", f"{pmet.get('Sharpe', np.nan):.2f}")
-            c4.metric("MaxDD", f"{pmet.get('Max Drawdown %', np.nan):.2f}%")
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=portfolio["eq_port"].index, y=portfolio["eq_port"], mode="lines", name="Equal-Weight Basket"))
-            if portfolio["eq_index"] is not None:
-                fig.add_trace(go.Scatter(x=portfolio["eq_index"].index, y=portfolio["eq_index"], mode="lines", name="XU100"))
-            fig.update_layout(title="Mini Portfolio Equity Curve vs XU100", yaxis_title="Normalized Equity")
-            st.plotly_chart(clean_fig(fig, height=560), width="stretch", theme=None)
-
-            st.markdown("#### Portfolio vs Benchmark Metrics")
-            st.dataframe(style_smart_table(pd.DataFrame([pmet, imet])), width="stretch")
-            st.markdown("#### Component Total Returns")
-            comp = portfolio["asset_total_ret"].mul(100).sort_values(ascending=False).reset_index()
-            comp.columns = ["Symbol", "Total Return %"]
-            st.dataframe(style_smart_table(comp), width="stretch")
-            st.plotly_chart(corr_heatmap(portfolio["corr"], "Portfolio Component Correlation Matrix"), width="stretch", theme=None)
-
-
-
-# -------------------------------------------------------------------------
-# TAB 9: LEADING AL/SAT SIGNAL LAB
-# -------------------------------------------------------------------------
-with tab9:
-    st.subheader("Leading Signal Lab — Vectorised Backtest Without Zipline")
-    st.markdown(
-        "<div class='ok-note'><b>Methodology:</b> The classic mode reproduces the transparent moving-average crossover approach used as a practical alternative to Zipline. The advanced mode adds trend, prior-high breakout, MACD acceleration, RSI regime, volume and optional XU100 regime confirmation. All decisions are generated at the close and applied from the next trading bar, preventing look-ahead bias.</div>",
-        unsafe_allow_html=True,
-    )
-    c1,c2,c3,c4=st.columns(4)
-    signal_mode=c1.selectbox("Signal Method",["Classic SMA Crossover","Advanced Multi-Confirmation"],index=1,key="lead_mode")
-    lead_fast=c2.slider("Fast Window",5,80,20,1,key="lead_fast")
-    lead_slow=c3.slider("Slow Window",20,250,60,5,key="lead_slow")
-    lead_breakout=c4.slider("Breakout Lookback",10,100,20,5,key="lead_breakout")
-    if lead_fast>=lead_slow:
-        st.error("Fast Window must be smaller than Slow Window.")
-    else:
-        d1,d2,d3,d4=st.columns(4)
-        lead_entry=d1.slider("Advanced Entry Score",2,6,4,1,key="lead_entry",disabled=(signal_mode=="Classic SMA Crossover"))
-        lead_exit=d2.slider("Advanced Exit Score",0,5,2,1,key="lead_exit",disabled=(signal_mode=="Classic SMA Crossover"))
-        lead_volume=d3.checkbox("Use Volume Confirmation",True,key="lead_volume",disabled=(signal_mode=="Classic SMA Crossover"))
-        lead_market=d4.checkbox("Use XU100 Regime Confirmation",False,key="lead_market")
-        if lead_entry<=lead_exit and signal_mode=="Advanced Multi-Confirmation":
-            st.warning("Entry Score should normally be greater than Exit Score to avoid excessive switching.")
-        lab_df,lab_metrics=run_leading_signal_lab(
-            plot_data,mode=signal_mode,fast_window=lead_fast,slow_window=lead_slow,
-            breakout_window=lead_breakout,entry_score=lead_entry,exit_score=lead_exit,
-            use_volume_confirmation=lead_volume,
-            market_regime=(index_regime if lead_market else None),benchmark_ret=index_returns,
-            transaction_cost_bps=transaction_cost_bps,slippage_bps=slippage_bps,
-        )
-        latest_action=str(lab_df['Leading_Action'].iloc[-1])
-        latest_event=str(lab_df['Signal_Event'].iloc[-1]) or "No new event"
-        latest_score=float(lab_df['Signal_Score'].iloc[-1])
-        k1,k2,k3,k4,k5=st.columns(5)
-        k1.metric("Current Leading Action",latest_action)
-        k2.metric("Latest Event",latest_event)
-        k3.metric("Confirmation Score",f"{latest_score:.0f}")
-        k4.metric("Strategy CAGR",f"{lab_metrics.get('CAGR %',np.nan):.2f}%")
-        k5.metric("Strategy MaxDD",f"{lab_metrics.get('Max Drawdown %',np.nan):.2f}%")
-        st.plotly_chart(leading_signal_chart(lab_df,f"{selected_asset_name} ({ticker_symbol}) — {signal_mode}"),width="stretch",theme=None)
-        st.markdown("#### Signal Strategy Performance")
-        metric_order=['Total Return %','CAGR %','Ann Vol %','Sharpe','Sortino','Max Drawdown %','Win Rate %','Beta vs XU100','Information Ratio','Exposure %','Signal Count','Buy Signals','Sell Signals']
-        metric_df=pd.DataFrame([{'Metric':m,'Value':lab_metrics.get(m,np.nan)} for m in metric_order])
-        st.dataframe(style_smart_table(metric_df),width="stretch",hide_index=True)
-        st.markdown("#### Latest Signal Decisions and Confirmations")
-        lead_cols=['Close','SMA_Fast','SMA_Slow','EMA_Fast','EMA_Slow','RSI','MACD_HIST','Volume','Trend_Pass','Breakout_Pass','MACD_Pass','RSI_Pass','Volume_Pass','Market_Pass','Signal_Score','Signal_Event','Leading_Action','Position_Lab','Strategy_Return_Lab']
-        lead_show=lab_df[[c for c in lead_cols if c in lab_df.columns]].tail(250).sort_index(ascending=False)
-        st.dataframe(style_smart_table(lead_show),width="stretch",height=620)
-        st.download_button("Download Leading Signal Lab CSV",lab_df.to_csv(index=True).encode('utf-8'),file_name=f"{ticker_symbol.replace('.','_')}_leading_signal_lab.csv",mime='text/csv')
-        st.caption("AL/SAT outputs are model signals, not guaranteed forecasts or investment advice. Their consistency must be judged through out-of-sample testing, turnover, drawdown and stability across parameter ranges.")
-
-# -------------------------------------------------------------------------
-# TAB 10: INSTITUTIONAL DECISION ENGINE
-# -------------------------------------------------------------------------
-with tab10:
-    st.subheader("Institutional Leading Signal Engine — Explainable 100-Point Decision Score")
-    st.markdown(
-        "<div class='ok-note'><b>Methodology:</b> Seven transparent factors are scored from observed Yahoo Finance data only: Trend (20), Momentum (20), Relative Strength vs XU100 (15), Volume/Flow (15), Volatility Quality (10), Risk Quality (10), and Market Regime (10). Historical probabilities are empirical outcomes from resolved past observations with similar scores; they are not synthetic forecasts.</div>",
-        unsafe_allow_html=True,
-    )
-    h1,h2,h3 = st.columns(3)
-    decision_horizon = h1.selectbox("Probability Horizon", [20, 40, 60, 90], index=2, key="decision_horizon")
-    h2.caption("Current signal uses information available through the latest close.")
-    h3.caption("Forward outcomes are used only for historical validation rows whose horizons are complete.")
-
-    score_df, factor_df, decision = build_institutional_signal_engine(
-        plot_data,
-        benchmark_close=(idx_ind['Close'] if idx_ind is not None and 'Close' in idx_ind else None),
-        benchmark_returns=index_returns,
-        forward_horizon=int(decision_horizon),
-    )
-
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Institutional Score", f"{decision['Institutional Score']:.1f}/100")
-    c2.metric("Confidence", f"{decision['Confidence Score']:.1f}%")
-    c3.metric("Final Recommendation", decision['Recommendation'])
-    c4.metric("Historical Analogs", f"{decision['Historical Analog Count']}")
-
-    p1,p2,p3 = st.columns(3)
-    p1.metric(f"Positive Return Probability ({decision_horizon}D)", f"{decision.get(f'Positive Return Probability {decision_horizon}D %', np.nan):.1f}%")
-    p2.metric(f"+10% Probability ({decision_horizon}D)", f"{decision.get(f'+10% Probability {decision_horizon}D %', np.nan):.1f}%")
-    p3.metric(f"Outperform XU100 Probability ({decision_horizon}D)", f"{decision.get(f'Outperform XU100 Probability {decision_horizon}D %', np.nan):.1f}%")
-
-    st.plotly_chart(institutional_score_chart(score_df), width="stretch", theme=None)
-
-    st.markdown("#### Current Factor Scorecard")
-    factor_display = factor_df.copy()
-    factor_display['Score'] = factor_display['Score'].round(2)
-    factor_display['Maximum'] = factor_display['Maximum'].round(2)
-    factor_display['Contribution %'] = factor_display['Contribution %'].round(1)
-    st.dataframe(
-        factor_display,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            'Score': st.column_config.NumberColumn(format='%.2f'),
-            'Maximum': st.column_config.NumberColumn(format='%.2f'),
-            'Contribution %': st.column_config.ProgressColumn(min_value=0, max_value=100, format='%.1f%%'),
+    for name, meta in INSTRUMENTS.items():
+        ticker = meta["ticker"]
+        if ticker in market_data:
+            rows.append(summary_row(name, market_data[ticker], dxy_df))
+    summary_df = pd.DataFrame(rows)
+    render_dataframe(
+        summary_df,
+        {
+            "Latest": "%.3f",
+            "1D % / bp": "%.2f",
+            "1M % / bp": "%.2f",
+            "EWMA Vol %": "%.2f",
+            "DXY Corr 60": "%.3f",
+            "DXY Beta 60": "%.3f",
         },
     )
 
-    st.markdown("#### Diagnostics 2.0 — Latest Daily Decisions")
-    decision_cols = [
-        'Close','Institutional Score','Confidence Score','Recommendation',
-        'Trend Score','Momentum Score','Relative Strength Score','Volume Score',
-        'Volatility Score','Risk Score','Market Regime Score',
-        f'Forward {decision_horizon}D Return', f'Forward {decision_horizon}D Active Return',
-    ]
-    decision_table = score_df[[c for c in decision_cols if c in score_df.columns]].tail(300).sort_index(ascending=False).copy()
-    st.dataframe(style_smart_table(decision_table), width="stretch", height=650)
-    st.download_button(
-        "Download Institutional Decision Engine CSV",
-        score_df.to_csv(index=True).encode('utf-8'),
-        file_name=f"{ticker_symbol.replace('.','_')}_institutional_decision_engine.csv",
-        mime='text/csv',
-    )
-    st.caption("Scores and empirical probabilities are decision-support outputs, not guaranteed forecasts or investment advice. Validate stability across horizons, assets, transaction costs and out-of-sample periods.")
+    commodity_tickers = [INSTRUMENTS[n]["ticker"] for n in COMMODITY_NAMES if INSTRUMENTS[n]["ticker"] in market_data]
+    normalized = []
+    for ticker in commodity_tickers + [DXY_TICKER]:
+        p = market_data[ticker]["Analysis Price"].dropna()
+        normalized.append((p / p.iloc[0] * 100.0).rename(TICKER_TO_NAME[ticker]))
+    norm_df = pd.concat(normalized, axis=1, join="inner").dropna()
+    fig = px.line(norm_df, x=norm_df.index, y=norm_df.columns, title="Normalized Market Performance — Common Daily Sample (Base = 100)")
+    fig.update_layout(template="plotly_white", height=560, hovermode="x unified", legend_title_text="")
+    fig.update_xaxes(rangeselector=dict(buttons=[dict(count=6, label="6M", step="month", stepmode="backward"), dict(count=1, label="1Y", step="year", stepmode="backward"), dict(count=3, label="3Y", step="year", stepmode="backward"), dict(step="all", label="ALL")]))
+    st.plotly_chart(fig, width="stretch")
 
+    st.markdown("#### Current Regime Matrix")
+    regime_df = pd.DataFrame([{"Dimension": k, "Current State": v} for k, v in regime.items()])
+    st.dataframe(regime_df, width="stretch", hide_index=True)
+
+# 2) SMART PRICE STRUCTURE
+with tabs[1]:
+    st.subheader("Institutional Smart Price Structure")
+    st.markdown('<div class="section-note">Candlestick structure, trend averages, Bollinger envelope, regression trend channel, anchored VWAP, swing points and support/resistance levels are calculated solely from observed daily Yahoo Finance data.</div>', unsafe_allow_html=True)
+    st.plotly_chart(build_price_chart(selected_df, f"{selected_name} — Institutional Price Structure"), width="stretch")
+
+    structure = pd.DataFrame(
+        {
+            "Metric": ["Adjusted / Analysis Price", "EMA 20", "EMA 50", "EMA 200", "RSI", "ATR %", "20D Support", "20D Resistance"],
+            "Latest": [
+                selected_df["Analysis Price"].iloc[-1],
+                selected_df["EMA 20"].iloc[-1],
+                selected_df["EMA 50"].iloc[-1],
+                selected_df["EMA 200"].iloc[-1],
+                selected_df["RSI"].iloc[-1],
+                selected_df["ATR %"].iloc[-1] * 100.0,
+                selected_df["Low"].rolling(20).min().iloc[-1],
+                selected_df["High"].rolling(20).max().iloc[-1],
+            ],
+        }
+    )
+    render_dataframe(structure, {"Latest": "%.3f"})
+
+# 3) EWMA VOLATILITY
+with tabs[2]:
+    st.subheader("EWMA Volatility Laboratory")
+    st.markdown('<div class="section-note">EWMA λ=0.94 is the primary daily risk estimate. λ=0.97 and rolling 20D/60D/252D volatility provide persistence and horizon comparisons.</div>', unsafe_allow_html=True)
+    vol_df = selected_df[["EWMA Vol 0.94", "EWMA Vol 0.97", "Rolling Vol 20", "Rolling Vol 60", "Rolling Vol 252"]].dropna(how="all") * 100.0
+    fig = px.line(vol_df, x=vol_df.index, y=vol_df.columns, title=f"{selected_name} — Annualized Volatility Comparison")
+    fig.update_layout(template="plotly_white", height=590, hovermode="x unified", legend_title_text="")
+    fig.update_yaxes(title="Annualized Volatility %")
+    fig.update_xaxes(rangeselector=dict(buttons=[dict(count=6, label="6M", step="month", stepmode="backward"), dict(count=1, label="1Y", step="year", stepmode="backward"), dict(count=3, label="3Y", step="year", stepmode="backward"), dict(step="all", label="ALL")]))
+    st.plotly_chart(fig, width="stretch")
+
+    ewma = selected_df["EWMA Vol 0.94"].dropna()
+    vol_percentile = float((ewma <= ewma.iloc[-1]).mean() * 100.0) if not ewma.empty else np.nan
+    vol_z = float((ewma.iloc[-1] - ewma.tail(252).mean()) / ewma.tail(252).std(ddof=1)) if len(ewma.tail(252)) > 20 else np.nan
+    vol_change_20 = float((ewma.iloc[-1] / ewma.shift(20).iloc[-1] - 1.0) * 100.0) if len(ewma) > 20 and ewma.shift(20).iloc[-1] != 0 else np.nan
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("EWMA λ=0.94", fmt_number(ewma.iloc[-1] * 100.0, 2, "%"))
+    c2.metric("Historical Percentile", fmt_number(vol_percentile, 1, "%"))
+    c3.metric("252D Vol Z-Score", fmt_number(vol_z, 2))
+    c4.metric("20D Vol Change", fmt_number(vol_change_20, 1, "%"))
+
+    top_vol = selected_df[["EWMA Vol 0.94", "Log Return"]].dropna().nlargest(10, "EWMA Vol 0.94").copy()
+    top_vol["EWMA Vol %"] = top_vol["EWMA Vol 0.94"] * 100.0
+    top_vol["Daily Log Return %"] = top_vol["Log Return"] * 100.0
+    st.markdown("#### Highest EWMA Volatility Observations")
+    render_dataframe(top_vol[["EWMA Vol %", "Daily Log Return %"]], {"EWMA Vol %": "%.2f", "Daily Log Return %": "%.2f"}, hide_index=False)
+
+# 4) DXY RELATIONSHIP
+with tabs[3]:
+    st.subheader("DXY Transmission and Lead–Lag Analysis")
+    st.markdown('<div class="section-note">The DXY relationship is tested rather than assumed. Pairwise inner joins are used; missing return observations are not forward-filled.</div>', unsafe_allow_html=True)
+    rel_parts = [rolling_relationship(selected_df["Log Return"], dxy_df["Log Return"], w) for w in [20, 60, 120, 252]]
+    rel = pd.concat(rel_parts, axis=1)
+    rel["EWMA Corr 60"] = ewma_correlation(selected_df["Log Return"], dxy_df["Log Return"], 60)
+
+    corr_cols = ["Corr 20", "Corr 60", "Corr 120", "Corr 252", "EWMA Corr 60"]
+    corr_fig = px.line(rel[corr_cols], x=rel.index, y=corr_cols, title=f"{selected_name} vs DXY — Dynamic Correlation")
+    corr_fig.add_hline(y=0.0, line_dash="dot", line_color="#667085")
+    corr_fig.update_layout(template="plotly_white", height=560, hovermode="x unified", legend_title_text="")
+    corr_fig.update_yaxes(range=[-1, 1], title="Correlation")
+    st.plotly_chart(corr_fig, width="stretch")
+
+    beta_cols = ["Beta 20", "Beta 60", "Beta 120", "Beta 252"]
+    beta_fig = px.line(rel[beta_cols], x=rel.index, y=beta_cols, title=f"{selected_name} vs DXY — Rolling Beta")
+    beta_fig.add_hline(y=0.0, line_dash="dot", line_color="#667085")
+    beta_fig.update_layout(template="plotly_white", height=520, hovermode="x unified", legend_title_text="")
+    st.plotly_chart(beta_fig, width="stretch")
+
+    pair = pd.concat([selected_df["Log Return"].rename("Commodity"), dxy_df["Log Return"].rename("DXY")], axis=1, join="inner").dropna().tail(756)
+    pair_pct = pair * 100.0
+    scatter = go.Figure()
+    scatter.add_trace(go.Scatter(
+        x=pair_pct["DXY"], y=pair_pct["Commodity"], mode="markers", name="Daily Observations",
+        marker=dict(size=6, color="#214b73", opacity=0.45),
+        hovertemplate="DXY=%{x:.3f}%<br>Commodity=%{y:.3f}%<extra></extra>",
+    ))
+    if len(pair_pct) >= 30 and pair_pct["DXY"].std(ddof=1) > 0:
+        slope, intercept = np.polyfit(pair_pct["DXY"].values, pair_pct["Commodity"].values, 1)
+        x_line = np.linspace(pair_pct["DXY"].min(), pair_pct["DXY"].max(), 120)
+        scatter.add_trace(go.Scatter(
+            x=x_line, y=intercept + slope * x_line, mode="lines", name=f"OLS Fit (β={slope:.2f})",
+            line=dict(color="#9f2d2d", width=2.0),
+        ))
+    scatter.update_layout(
+        title=f"Daily Return Map — {selected_name} vs DXY (Latest 756 Common Observations)",
+        template="plotly_white", height=540, xaxis_title="DXY Daily Log Return %",
+        yaxis_title=f"{selected_name} Daily Log Return %",
+    )
+    st.plotly_chart(scatter, width="stretch")
+
+    lag_df = lead_lag_correlations(selected_df["Log Return"], dxy_df["Log Return"], 20)
+    lag_fig = go.Figure(go.Bar(x=lag_df["Lag"], y=lag_df["Correlation"], marker_color=np.where(lag_df["Correlation"] >= 0, "#214b73", "#9f2d2d")))
+    lag_fig.update_layout(title="Lead–Lag Correlation: Today's DXY Return vs Commodity Return at Lag h", template="plotly_white", height=470, xaxis_title="Lag h (positive = commodity return occurs later)", yaxis_title="Correlation")
+    st.plotly_chart(lag_fig, width="stretch")
+
+    scenario_df, regression_stats = regression_scenarios(selected_df, dxy_df, tnx_df)
+    st.markdown("#### Conditional DXY / UST10Y Shock Scenarios")
+    if scenario_df.empty:
+        st.warning("Insufficient common observations for the scenario regression.")
+    else:
+        left, right = st.columns([1.55, 1.0])
+        with left:
+            render_dataframe(scenario_df, {c: "%.2f" for c in scenario_df.columns if c != "Scenario"})
+        with right:
+            stats_table = pd.DataFrame([{"Statistic": k, "Value": v} for k, v in regression_stats.items()])
+            render_dataframe(stats_table, {"Value": "%.6f"})
+
+# 5) FORECAST LABORATORY
+with tabs[4]:
+    st.subheader("Walk-Forward Forecast Laboratory")
+    st.markdown('<div class="section-note">Forecasts are generated with information available at each historical decision date. A Ridge model, rolling macro regression and historical-mean benchmark are combined using inverse out-of-sample RMSE weights.</div>', unsafe_allow_html=True)
+
+    forecast_summaries = []
+    forecast_outputs: Dict[int, pd.DataFrame] = {}
+    model_tables: Dict[int, pd.DataFrame] = {}
+    if not forecast_horizons:
+        st.info("Select at least one forecast horizon from the sidebar.")
+    else:
+        for h in sorted(forecast_results):
+            pred_df, summary, model_table = forecast_results[h]
+            if summary:
+                forecast_summaries.append(summary)
+                forecast_outputs[h] = pred_df
+                model_tables[h] = model_table
+
+        if not forecast_summaries:
+            st.warning("The common sample is insufficient for walk-forward validation. Extend the start date or choose an instrument with a longer history.")
+        else:
+            summary_table = pd.DataFrame(forecast_summaries)
+            display = summary_table.copy()
+            for col in ["Forecast Log Return", "Forecast Simple Return", "Lower 95%", "Upper 95%", "OOS R2", "RMSE", "MAE", "Directional Accuracy", "Forecast Correlation", "Residual Std", "Ridge Weight", "Macro Weight", "Historical Mean Weight"]:
+                if col in display:
+                    display[col] = display[col] * 100.0
+            render_dataframe(
+                display,
+                {
+                    "Current Price": "%.3f",
+                    "Implied Price Target": "%.3f",
+                    "Lower Price Target 95%": "%.3f",
+                    "Upper Price Target 95%": "%.3f",
+                    "Forecast Log Return": "%.2f%%",
+                    "Forecast Simple Return": "%.2f%%",
+                    "Positive Probability %": "%.1f%%",
+                    "Lower 95%": "%.2f%%",
+                    "Upper 95%": "%.2f%%",
+                    "OOS R2": "%.2f%%",
+                    "RMSE": "%.2f%%",
+                    "MAE": "%.2f%%",
+                    "Directional Accuracy": "%.1f%%",
+                    "Forecast Correlation": "%.2f%%",
+                    "Residual Std": "%.2f%%",
+                    "Ridge Weight": "%.1f%%",
+                    "Macro Weight": "%.1f%%",
+                    "Historical Mean Weight": "%.1f%%",
+                },
+            )
+
+            for h in sorted(forecast_outputs):
+                pred_df = forecast_outputs[h]
+                summary = next(x for x in forecast_summaries if x["Horizon"] == h)
+                st.markdown(f"#### {h}-Trading-Day Forecast")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Expected Return", fmt_number(summary["Forecast Simple Return"] * 100.0, 2, "%"))
+                c2.metric("Implied Target", fmt_number(summary["Implied Price Target"], 3))
+                c3.metric("Positive Probability", fmt_number(summary["Positive Probability %"], 1, "%"))
+                c4.metric("Directional Accuracy", fmt_number(summary["Directional Accuracy"] * 100.0, 1, "%"))
+                c5.metric("OOS R² vs Mean", fmt_number(summary["OOS R2"] * 100.0, 2, "%"))
+
+                chart_df = pred_df[["Actual", "Ensemble", "Ridge", "Macro Regression"]].copy() * 100.0
+                ffig = px.line(chart_df, x=chart_df.index, y=chart_df.columns, title=f"{h}D Walk-Forward Forecast vs Realized Log Return")
+                ffig.update_layout(template="plotly_white", height=480, hovermode="x unified", legend_title_text="")
+                ffig.update_yaxes(title="Forward Log Return %")
+                st.plotly_chart(ffig, width="stretch")
+                render_dataframe(model_tables[h], {"Forecast Log Return %": "%.3f", "Ensemble Weight %": "%.1f"})
+
+# 6) LOG RETURN DIFFERENCE ±2 SIGMA
+with tabs[5]:
+    st.subheader("Daily Log-Return Difference and Statistical Bands")
+    st.markdown('<div class="section-note">Return Difference is Δrₜ = rₜ − rₜ₋₁. The upper and lower control bands are the rolling mean ± 2 standard deviations. Band breaches are observed market outcomes, not generated data.</div>', unsafe_allow_html=True)
+    diff = selected_df["Return Difference"]
+    mean = diff.rolling(log_band_window, min_periods=max(10, log_band_window // 2)).mean()
+    sigma = diff.rolling(log_band_window, min_periods=max(10, log_band_window // 2)).std(ddof=1)
+    upper = mean + 2.0 * sigma
+    lower = mean - 2.0 * sigma
+    band_df = pd.DataFrame({"Return Difference": diff * 100.0, "Rolling Mean": mean * 100.0, "+2 Sigma": upper * 100.0, "-2 Sigma": lower * 100.0}).dropna(how="all")
+    upper_breach = diff > upper
+    lower_breach = diff < lower
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=band_df.index, y=band_df["+2 Sigma"], mode="lines", name="+2 Sigma", line=dict(color="#9f2d2d", width=1.0, dash="dash")))
+    fig.add_trace(go.Scatter(x=band_df.index, y=band_df["-2 Sigma"], mode="lines", name="-2 Sigma", line=dict(color="#176b45", width=1.0, dash="dash"), fill="tonexty", fillcolor="rgba(33,75,115,0.05)"))
+    fig.add_trace(go.Scatter(x=band_df.index, y=band_df["Rolling Mean"], mode="lines", name="Rolling Mean", line=dict(color="#214b73", width=1.3)))
+    fig.add_trace(go.Scatter(x=band_df.index, y=band_df["Return Difference"], mode="lines", name="Daily Return Difference", line=dict(color="#344054", width=1.0)))
+    fig.add_trace(go.Scatter(x=selected_df.index[upper_breach.fillna(False)], y=(diff[upper_breach.fillna(False)] * 100.0), mode="markers", name="Upper Breach", marker=dict(color="#9f2d2d", size=8, symbol="triangle-up")))
+    fig.add_trace(go.Scatter(x=selected_df.index[lower_breach.fillna(False)], y=(diff[lower_breach.fillna(False)] * 100.0), mode="markers", name="Lower Breach", marker=dict(color="#176b45", size=8, symbol="triangle-down")))
+    fig.update_layout(title=f"{selected_name} — Δ Log Return with {log_band_window}D Mean ± 2σ", template="plotly_white", height=620, hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1.0, xanchor="right"))
+    fig.update_yaxes(title="Return Difference %")
+    st.plotly_chart(fig, width="stretch")
+
+    future_5 = selected_df["Analysis Price"].shift(-5) / selected_df["Analysis Price"] - 1.0
+    future_20 = selected_df["Analysis Price"].shift(-20) / selected_df["Analysis Price"] - 1.0
+    breach_stats = []
+    for label, mask in [("Upper +2σ Breach", upper_breach), ("Lower -2σ Breach", lower_breach)]:
+        resolved = pd.DataFrame({"Mask": mask, "Fwd 5D": future_5, "Fwd 20D": future_20}).dropna()
+        resolved = resolved[resolved["Mask"]]
+        breach_stats.append(
+            {
+                "Event": label,
+                "Resolved Events": int(len(resolved)),
+                "Average Forward 5D %": float(resolved["Fwd 5D"].mean() * 100.0) if len(resolved) else np.nan,
+                "Positive Forward 5D %": float((resolved["Fwd 5D"] > 0).mean() * 100.0) if len(resolved) else np.nan,
+                "Average Forward 20D %": float(resolved["Fwd 20D"].mean() * 100.0) if len(resolved) else np.nan,
+                "Positive Forward 20D %": float((resolved["Fwd 20D"] > 0).mean() * 100.0) if len(resolved) else np.nan,
+            }
+        )
+    render_dataframe(pd.DataFrame(breach_stats), {c: "%.2f" for c in breach_stats[0] if c not in ["Event", "Resolved Events"]})
+
+# 7) CROSS-ASSET MATRIX
+with tabs[6]:
+    st.subheader("Cross-Asset Dependence Matrix")
+    st.markdown('<div class="section-note">All matrices use a common daily sample. The UST10Y series is represented by daily basis-point changes; price instruments use daily log returns.</div>', unsafe_allow_html=True)
+    series = []
+    for name, meta in INSTRUMENTS.items():
+        ticker = meta["ticker"]
+        if ticker not in market_data:
+            continue
+        if meta["type"] == "yield":
+            s = yield_bp_change(market_data[ticker]).rename(meta["short"])
+        else:
+            s = market_data[ticker]["Log Return"].rename(meta["short"])
+        series.append(s)
+    cross = pd.concat(series, axis=1, join="inner").dropna()
+    lookback = min(504, len(cross))
+    corr_matrix = cross.tail(lookback).corr()
+    heat = px.imshow(corr_matrix, text_auto=".2f", color_continuous_scale="RdBu", zmin=-1, zmax=1, title=f"Cross-Asset Correlation Matrix — Latest {lookback} Common Daily Observations")
+    heat.update_layout(template="plotly_white", height=650)
+    st.plotly_chart(heat, width="stretch")
+
+    rolling_selected = pd.DataFrame(index=cross.index)
+    for col in cross.columns:
+        if col != INSTRUMENTS[selected_name]["short"]:
+            rolling_selected[col] = cross[INSTRUMENTS[selected_name]["short"]].rolling(60, min_periods=40).corr(cross[col])
+    roll_fig = px.line(rolling_selected, x=rolling_selected.index, y=rolling_selected.columns, title=f"{selected_name} — 60D Rolling Cross-Asset Correlations")
+    roll_fig.update_layout(template="plotly_white", height=560, hovermode="x unified", legend_title_text="")
+    roll_fig.update_yaxes(range=[-1, 1], title="Correlation")
+    st.plotly_chart(roll_fig, width="stretch")
+
+# 8) MODEL VALIDATION
+with tabs[7]:
+    st.subheader("Model Validation and Governance")
+    st.markdown('<div class="section-note">A model is not accepted merely because it fits the historical sample. The primary evidence is walk-forward, out-of-sample performance against the historical-mean benchmark.</div>', unsafe_allow_html=True)
+    validation_rows = []
+    if forecast_horizons:
+        for h in sorted(forecast_results):
+            pred_df, summary, _ = forecast_results[h]
+            if summary:
+                validation_rows.append(
+                {
+                        "Horizon": h,
+                        "OOS Observations": summary["OOS Observations"],
+                        "OOS R2 vs Mean %": summary["OOS R2"] * 100.0,
+                        "RMSE %": summary["RMSE"] * 100.0,
+                        "MAE %": summary["MAE"] * 100.0,
+                        "Directional Accuracy %": summary["Directional Accuracy"] * 100.0,
+                        "Forecast Correlation": summary["Forecast Correlation"],
+                        "Residual Std %": summary["Residual Std"] * 100.0,
+                        "Ridge Alpha": summary["Ridge Alpha"],
+                        "Status": "PASS" if summary["OOS R2"] > 0 and summary["Directional Accuracy"] >= 0.52 else "REVIEW",
+                    }
+                )
+    if validation_rows:
+        validation_df = pd.DataFrame(validation_rows)
+        render_dataframe(validation_df, {
+            "OOS R2 vs Mean %": "%.2f",
+            "RMSE %": "%.2f",
+            "MAE %": "%.2f",
+            "Directional Accuracy %": "%.1f",
+            "Forecast Correlation": "%.3f",
+            "Residual Std %": "%.2f",
+            "Ridge Alpha": "%.2f",
+        })
+
+        val_fig = px.bar(validation_df, x="Horizon", y="OOS R2 vs Mean %", color="Status", barmode="group", title="Out-of-Sample R² by Forecast Horizon")
+        val_fig.add_hline(y=0.0, line_dash="dot", line_color="#667085")
+        val_fig.update_layout(template="plotly_white", height=450)
+        st.plotly_chart(val_fig, width="stretch")
+    else:
+        st.info("No validation result is available for the current date range and horizon selection.")
+
+    methodology = pd.DataFrame(
+        [
+            ("Data", "Yahoo Finance daily observations only; auto_adjust=False"),
+            ("Price Return", "Log return of Adj Close where available, otherwise Close"),
+            ("UST10Y Transformation", "Daily percentage-point change × 100 = basis-point change"),
+            ("Forecast Target", "Forward 1D / 5D / 20D / 60D log return"),
+            ("Predictive Engine", "Ridge shrinkage + rolling macro regression + historical mean"),
+            ("Combination", "Inverse walk-forward RMSE weights"),
+            ("Validation", "Expanding walk-forward; target availability lag enforced"),
+            ("No Leakage", "Training targets restricted to dates resolved by each decision date"),
+            ("Missing Data", "No forward filling of daily returns"),
+            ("Synthetic Data", "Not used"),
+        ],
+        columns=["Control", "Implementation"],
+    )
+    st.markdown("#### Methodology Controls")
+    st.dataframe(methodology, width="stretch", hide_index=True)
+
+# 9) DATA GOVERNANCE
+with tabs[8]:
+    st.subheader("Data Governance and Download Center")
+    st.markdown('<div class="section-note">The table below records the actual observations retrieved from Yahoo Finance. Failed instruments remain visible and are not replaced with proxies or synthetic series.</div>', unsafe_allow_html=True)
+    st.dataframe(governance, width="stretch", hide_index=True)
+
+    selected_export = selected_df.copy()
+    selected_export.index.name = "Date"
+    st.download_button(
+        label=f"Download {selected_ticker} Daily Data CSV",
+        data=selected_export.to_csv(index=True).encode("utf-8"),
+        file_name=f"{selected_ticker.replace('^', '').replace('=', '_')}_daily_yahoo.csv",
+        mime="text/csv",
+    )
+
+    all_returns = []
+    for name, meta in INSTRUMENTS.items():
+        ticker = meta["ticker"]
+        if ticker not in market_data:
+            continue
+        if meta["type"] == "yield":
+            s = yield_bp_change(market_data[ticker]).rename(f"{ticker}_BP_CHANGE")
+        else:
+            s = market_data[ticker]["Log Return"].rename(f"{ticker}_LOG_RETURN")
+        all_returns.append(s)
+    if all_returns:
+        export_returns = pd.concat(all_returns, axis=1)
+        export_returns.index.name = "Date"
+        st.download_button(
+            label="Download Cross-Asset Return Matrix CSV",
+            data=export_returns.to_csv(index=True).encode("utf-8"),
+            file_name="CommodityMacroPro_cross_asset_daily_returns.csv",
+            mime="text/csv",
+        )
+
+st.markdown("---")
+st.caption(f"By MK FinTECH LabGEN@2026 Istanbul · {APP_NAME} V{APP_VERSION} · Yahoo Finance daily market observations only · Single-thread cloud numerical engine · Not investment advice")
