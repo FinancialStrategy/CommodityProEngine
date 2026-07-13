@@ -9,9 +9,23 @@ Run:
     streamlit run app.py
 """
 
+import os
+import gc
 import math
 import warnings
 from datetime import datetime
+
+# Streamlit Cloud stability: prevent BLAS/OpenMP oversubscription during repeated
+# walk-forward Ridge/OLS fits. These variables must be set before NumPy/SciPy import.
+for _thread_env in (
+    'OMP_NUM_THREADS',
+    'OPENBLAS_NUM_THREADS',
+    'MKL_NUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+    'VECLIB_MAXIMUM_THREADS',
+    'BLIS_NUM_THREADS',
+):
+    os.environ[_thread_env] = '1'
 from typing import Dict, List, Optional, Tuple
 
 warnings.filterwarnings("ignore")
@@ -25,11 +39,12 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.preprocessing import StandardScaler
+from threadpoolctl import threadpool_limits
 
 # -----------------------------------------------------------------------------
 # APPLICATION CONFIGURATION
 # -----------------------------------------------------------------------------
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_NAME = "CommodityMacroPro Institutional"
 TRADING_DAYS = 252
 DXY_TICKER = "DX-Y.NYB"
@@ -453,11 +468,13 @@ def regression_scenarios(asset_df: pd.DataFrame, dxy_df: pd.DataFrame, tnx_df: p
     if len(frame) < 120:
         return pd.DataFrame(), {}
     frame["Interaction"] = frame["DXY"] * frame["TNX_bp"]
-    X = frame[["DXY", "TNX_bp", "Interaction"]].values
-    y = frame["Asset"].values
-    model = LinearRegression().fit(X, y)
-    r2 = float(model.score(X, y))
-    resid_std = float(np.std(y - model.predict(X), ddof=1))
+    X = np.ascontiguousarray(frame[["DXY", "TNX_bp", "Interaction"]].to_numpy(dtype=np.float64, copy=True))
+    y = np.ascontiguousarray(frame["Asset"].to_numpy(dtype=np.float64, copy=True))
+    with threadpool_limits(limits=1):
+        model = LinearRegression(n_jobs=1).fit(X, y)
+        fitted = model.predict(X)
+        r2 = float(model.score(X, y))
+    resid_std = float(np.std(y - fitted, ddof=1))
     scenarios = [
         ("DXY +1%", 0.01, 0.0),
         ("DXY -1%", -0.01, 0.0),
@@ -662,11 +679,34 @@ def build_model_frame(asset_df: pd.DataFrame, dxy_df: pd.DataFrame, tnx_df: pd.D
 
 
 def fit_scaled_ridge(X: pd.DataFrame, y: pd.Series, alpha: float) -> Tuple[StandardScaler, Ridge]:
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X.values)
-    model = Ridge(alpha=float(alpha))
-    model.fit(Xs, y.values)
+    """Fit a numerically stable single-thread Ridge model on contiguous float64 arrays."""
+    X_arr = np.ascontiguousarray(X.to_numpy(dtype=np.float64, copy=True))
+    y_arr = np.ascontiguousarray(y.to_numpy(dtype=np.float64, copy=True))
+    scaler = StandardScaler(copy=True)
+    with threadpool_limits(limits=1):
+        Xs = scaler.fit_transform(X_arr)
+        model = Ridge(alpha=float(alpha), solver="lsqr", tol=1e-7, max_iter=5000)
+        model.fit(Xs, y_arr)
     return scaler, model
+
+
+def macro_regression_prediction(
+    train: pd.DataFrame,
+    row: pd.DataFrame,
+    macro_cols: List[str],
+    target_col: str,
+) -> float:
+    """Transparent DXY/UST10Y regression with bounded native-thread usage."""
+    macro_train = train.dropna(subset=macro_cols + [target_col]).tail(756)
+    if len(macro_train) < 120:
+        return float(train[target_col].tail(756).mean())
+    X_train = np.ascontiguousarray(macro_train[macro_cols].to_numpy(dtype=np.float64, copy=True))
+    y_train = np.ascontiguousarray(macro_train[target_col].to_numpy(dtype=np.float64, copy=True))
+    X_row = np.ascontiguousarray(row[macro_cols].to_numpy(dtype=np.float64, copy=True))
+    with threadpool_limits(limits=1):
+        macro_model = LinearRegression(n_jobs=1).fit(X_train, y_train)
+        prediction = macro_model.predict(X_row)
+    return float(prediction[0])
 
 
 def choose_alpha(X: pd.DataFrame, y: pd.Series, candidates: Tuple[float, ...] = (0.1, 1.0, 10.0, 100.0)) -> float:
@@ -681,8 +721,11 @@ def choose_alpha(X: pd.DataFrame, y: pd.Series, candidates: Tuple[float, ...] = 
     best_rmse = np.inf
     for alpha in candidates:
         scaler, model = fit_scaled_ridge(X_train, y_train, alpha)
-        pred = model.predict(scaler.transform(X_val.values))
-        rmse = float(np.sqrt(np.mean((y_val.values - pred) ** 2)))
+        X_val_arr = np.ascontiguousarray(X_val.to_numpy(dtype=np.float64, copy=True))
+        y_val_arr = np.ascontiguousarray(y_val.to_numpy(dtype=np.float64, copy=True))
+        with threadpool_limits(limits=1):
+            pred = model.predict(scaler.transform(X_val_arr))
+        rmse = float(np.sqrt(np.mean((y_val_arr - pred) ** 2)))
         if rmse < best_rmse:
             best_rmse = rmse
             best_alpha = float(alpha)
@@ -697,6 +740,8 @@ def walk_forward_forecast(
     min_train: int = 400,
     max_oos: int = 180,
 ) -> Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame]:
+    horizon = int(horizon)
+    max_oos = int(min(max(60, max_oos), 240))
     frame, feature_cols, target_col = build_model_frame(asset_df, dxy_df, tnx_df, horizon)
     usable_features = frame.dropna(subset=feature_cols).copy()
     if len(usable_features) < min_train + horizon + 30:
@@ -726,16 +771,13 @@ def walk_forward_forecast(
             continue
 
         scaler, ridge = fit_scaled_ridge(train[feature_cols], train[target_col], alpha)
-        ridge_pred = float(ridge.predict(scaler.transform(row[feature_cols].values))[0])
+        row_features = np.ascontiguousarray(row[feature_cols].to_numpy(dtype=np.float64, copy=True))
+        with threadpool_limits(limits=1):
+            ridge_pred = float(ridge.predict(scaler.transform(row_features))[0])
 
         # Rolling macro regression: transparent DXY + yield relationship benchmark.
         macro_cols = ["DXY Log Return", "DXY Momentum 20", "TNX bp 1D", "TNX bp 20D", "DXY x TNX"]
-        macro_train = train.dropna(subset=macro_cols + [target_col]).tail(756)
-        if len(macro_train) >= 120:
-            macro_model = LinearRegression().fit(macro_train[macro_cols].values, macro_train[target_col].values)
-            macro_pred = float(macro_model.predict(row[macro_cols].values)[0])
-        else:
-            macro_pred = float(train[target_col].mean())
+        macro_pred = macro_regression_prediction(train, row, macro_cols, target_col)
 
         hist_mean_pred = float(train[target_col].tail(756).mean())
         actual = float(row[target_col].iloc[0])
@@ -749,6 +791,8 @@ def walk_forward_forecast(
                 "Historical Mean": hist_mean_pred,
             }
         )
+        if len(predictions) % 30 == 0:
+            gc.collect()
 
     pred_df = pd.DataFrame(predictions).set_index("Date") if predictions else pd.DataFrame()
     if pred_df.empty:
@@ -779,14 +823,11 @@ def walk_forward_forecast(
         return pred_df, {}, pd.DataFrame()
 
     scaler, ridge = fit_scaled_ridge(latest_train[feature_cols], latest_train[target_col], alpha)
-    latest_ridge = float(ridge.predict(scaler.transform(latest_row[feature_cols].values))[0])
+    latest_features = np.ascontiguousarray(latest_row[feature_cols].to_numpy(dtype=np.float64, copy=True))
+    with threadpool_limits(limits=1):
+        latest_ridge = float(ridge.predict(scaler.transform(latest_features))[0])
     macro_cols = ["DXY Log Return", "DXY Momentum 20", "TNX bp 1D", "TNX bp 20D", "DXY x TNX"]
-    macro_train = latest_train.dropna(subset=macro_cols + [target_col]).tail(756)
-    if len(macro_train) >= 120:
-        macro_model = LinearRegression().fit(macro_train[macro_cols].values, macro_train[target_col].values)
-        latest_macro = float(macro_model.predict(latest_row[macro_cols].values)[0])
-    else:
-        latest_macro = float(latest_train[target_col].tail(756).mean())
+    latest_macro = macro_regression_prediction(latest_train, latest_row, macro_cols, target_col)
     latest_mean = float(latest_train[target_col].tail(756).mean())
     latest_ensemble = weights["Ridge"] * latest_ridge + weights["Macro Regression"] * latest_macro + weights["Historical Mean"] * latest_mean
     positive_probability = norm_cdf(latest_ensemble / max(residual_std, 1e-10)) * 100.0
@@ -897,10 +938,11 @@ start_date = st.sidebar.date_input("Start Date", pd.Timestamp("2010-01-01"))
 end_date = st.sidebar.date_input("End Date", pd.Timestamp.today() + pd.Timedelta(days=1))
 log_band_window = st.sidebar.selectbox("Log-Return Difference Band", [20, 60, 120], index=0)
 forecast_horizons = st.sidebar.multiselect("Forecast Horizons", [1, 5, 20, 60], default=[1, 5, 20, 60])
-max_oos = st.sidebar.slider("Walk-Forward OOS Window", min_value=90, max_value=360, value=180, step=30)
+max_oos = st.sidebar.slider("Walk-Forward OOS Window", min_value=60, max_value=240, value=120, step=30)
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Methodology: Ridge shrinkage, rolling macro regression, historical-mean benchmark, inverse-RMSE forecast combination and regime diagnostics.")
+st.sidebar.caption("Cloud numerical engine: single-thread BLAS/OpenMP · shared walk-forward results · stable package pins.")
 
 # -----------------------------------------------------------------------------
 # DATA LOAD
@@ -912,7 +954,7 @@ required_tickers = [selected_ticker, DXY_TICKER, TNX_TICKER]
 missing_required = [t for t in required_tickers if t not in market_data]
 if missing_required:
     st.error("Required Yahoo Finance series could not be loaded: " + ", ".join(missing_required))
-    st.dataframe(governance, use_container_width=True, hide_index=True)
+    st.dataframe(governance, width="stretch", hide_index=True)
     st.stop()
 
 selected_df = market_data[selected_ticker]
@@ -970,6 +1012,18 @@ kpi_cols[6].metric("DXY Regime", regime["DXY Regime"])
 kpi_cols[7].metric("Risk Regime", regime["Volatility Regime"])
 
 # -----------------------------------------------------------------------------
+# SHARED FORECAST RESULTS — COMPUTED ONCE PER RERUN
+# -----------------------------------------------------------------------------
+forecast_results: Dict[int, Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame]] = {}
+if forecast_horizons:
+    with st.spinner("Running single-pass walk-forward forecasts..."):
+        for _h in sorted(set(int(x) for x in forecast_horizons)):
+            forecast_results[_h] = walk_forward_forecast(
+                selected_df, dxy_df, tnx_df, _h, min_train=400, max_oos=max_oos
+            )
+    gc.collect()
+
+# -----------------------------------------------------------------------------
 # TABS
 # -----------------------------------------------------------------------------
 tabs = st.tabs(
@@ -1008,7 +1062,7 @@ with tabs[0]:
             },
             na_rep="N/A",
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1021,17 +1075,17 @@ with tabs[0]:
     fig = px.line(norm_df, x=norm_df.index, y=norm_df.columns, title="Normalized Market Performance — Common Daily Sample (Base = 100)")
     fig.update_layout(template="plotly_white", height=560, hovermode="x unified", legend_title_text="")
     fig.update_xaxes(rangeselector=dict(buttons=[dict(count=6, label="6M", step="month", stepmode="backward"), dict(count=1, label="1Y", step="year", stepmode="backward"), dict(count=3, label="3Y", step="year", stepmode="backward"), dict(step="all", label="ALL")]))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.markdown("#### Current Regime Matrix")
     regime_df = pd.DataFrame([{"Dimension": k, "Current State": v} for k, v in regime.items()])
-    st.dataframe(regime_df, use_container_width=True, hide_index=True)
+    st.dataframe(regime_df, width="stretch", hide_index=True)
 
 # 2) SMART PRICE STRUCTURE
 with tabs[1]:
     st.subheader("Institutional Smart Price Structure")
     st.markdown('<div class="section-note">Candlestick structure, trend averages, Bollinger envelope, regression trend channel, anchored VWAP, swing points and support/resistance levels are calculated solely from observed daily Yahoo Finance data.</div>', unsafe_allow_html=True)
-    st.plotly_chart(build_price_chart(selected_df, f"{selected_name} — Institutional Price Structure"), use_container_width=True)
+    st.plotly_chart(build_price_chart(selected_df, f"{selected_name} — Institutional Price Structure"), width="stretch")
 
     structure = pd.DataFrame(
         {
@@ -1048,7 +1102,7 @@ with tabs[1]:
             ],
         }
     )
-    st.dataframe(structure.style.format({"Latest": "{:,.3f}"}, na_rep="N/A"), use_container_width=True, hide_index=True)
+    st.dataframe(structure.style.format({"Latest": "{:,.3f}"}, na_rep="N/A"), width="stretch", hide_index=True)
 
 # 3) EWMA VOLATILITY
 with tabs[2]:
@@ -1059,7 +1113,7 @@ with tabs[2]:
     fig.update_layout(template="plotly_white", height=590, hovermode="x unified", legend_title_text="")
     fig.update_yaxes(title="Annualized Volatility %")
     fig.update_xaxes(rangeselector=dict(buttons=[dict(count=6, label="6M", step="month", stepmode="backward"), dict(count=1, label="1Y", step="year", stepmode="backward"), dict(count=3, label="3Y", step="year", stepmode="backward"), dict(step="all", label="ALL")]))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     ewma = selected_df["EWMA Vol 0.94"].dropna()
     vol_percentile = float((ewma <= ewma.iloc[-1]).mean() * 100.0) if not ewma.empty else np.nan
@@ -1075,7 +1129,7 @@ with tabs[2]:
     top_vol["EWMA Vol %"] = top_vol["EWMA Vol 0.94"] * 100.0
     top_vol["Daily Log Return %"] = top_vol["Log Return"] * 100.0
     st.markdown("#### Highest EWMA Volatility Observations")
-    st.dataframe(top_vol[["EWMA Vol %", "Daily Log Return %"]].style.format("{:,.2f}"), use_container_width=True)
+    st.dataframe(top_vol[["EWMA Vol %", "Daily Log Return %"]].style.format("{:,.2f}"), width="stretch")
 
 # 4) DXY RELATIONSHIP
 with tabs[3]:
@@ -1090,13 +1144,13 @@ with tabs[3]:
     corr_fig.add_hline(y=0.0, line_dash="dot", line_color="#667085")
     corr_fig.update_layout(template="plotly_white", height=560, hovermode="x unified", legend_title_text="")
     corr_fig.update_yaxes(range=[-1, 1], title="Correlation")
-    st.plotly_chart(corr_fig, use_container_width=True)
+    st.plotly_chart(corr_fig, width="stretch")
 
     beta_cols = ["Beta 20", "Beta 60", "Beta 120", "Beta 252"]
     beta_fig = px.line(rel[beta_cols], x=rel.index, y=beta_cols, title=f"{selected_name} vs DXY — Rolling Beta")
     beta_fig.add_hline(y=0.0, line_dash="dot", line_color="#667085")
     beta_fig.update_layout(template="plotly_white", height=520, hovermode="x unified", legend_title_text="")
-    st.plotly_chart(beta_fig, use_container_width=True)
+    st.plotly_chart(beta_fig, width="stretch")
 
     pair = pd.concat([selected_df["Log Return"].rename("Commodity"), dxy_df["Log Return"].rename("DXY")], axis=1, join="inner").dropna().tail(756)
     pair_pct = pair * 100.0
@@ -1118,12 +1172,12 @@ with tabs[3]:
         template="plotly_white", height=540, xaxis_title="DXY Daily Log Return %",
         yaxis_title=f"{selected_name} Daily Log Return %",
     )
-    st.plotly_chart(scatter, use_container_width=True)
+    st.plotly_chart(scatter, width="stretch")
 
     lag_df = lead_lag_correlations(selected_df["Log Return"], dxy_df["Log Return"], 20)
     lag_fig = go.Figure(go.Bar(x=lag_df["Lag"], y=lag_df["Correlation"], marker_color=np.where(lag_df["Correlation"] >= 0, "#214b73", "#9f2d2d")))
     lag_fig.update_layout(title="Lead–Lag Correlation: Today's DXY Return vs Commodity Return at Lag h", template="plotly_white", height=470, xaxis_title="Lag h (positive = commodity return occurs later)", yaxis_title="Correlation")
-    st.plotly_chart(lag_fig, use_container_width=True)
+    st.plotly_chart(lag_fig, width="stretch")
 
     scenario_df, regression_stats = regression_scenarios(selected_df, dxy_df, tnx_df)
     st.markdown("#### Conditional DXY / UST10Y Shock Scenarios")
@@ -1132,10 +1186,10 @@ with tabs[3]:
     else:
         left, right = st.columns([1.55, 1.0])
         with left:
-            st.dataframe(scenario_df.style.format({c: "{:,.2f}" for c in scenario_df.columns if c != "Scenario"}), use_container_width=True, hide_index=True)
+            st.dataframe(scenario_df.style.format({c: "{:,.2f}" for c in scenario_df.columns if c != "Scenario"}), width="stretch", hide_index=True)
         with right:
             stats_table = pd.DataFrame([{"Statistic": k, "Value": v} for k, v in regression_stats.items()])
-            st.dataframe(stats_table.style.format({"Value": "{:,.6f}"}, na_rep="N/A"), use_container_width=True, hide_index=True)
+            st.dataframe(stats_table.style.format({"Value": "{:,.6f}"}, na_rep="N/A"), width="stretch", hide_index=True)
 
 # 5) FORECAST LABORATORY
 with tabs[4]:
@@ -1148,13 +1202,12 @@ with tabs[4]:
     if not forecast_horizons:
         st.info("Select at least one forecast horizon from the sidebar.")
     else:
-        with st.spinner("Running walk-forward forecasts..."):
-            for h in sorted(forecast_horizons):
-                pred_df, summary, model_table = walk_forward_forecast(selected_df, dxy_df, tnx_df, h, min_train=400, max_oos=max_oos)
-                if summary:
-                    forecast_summaries.append(summary)
-                    forecast_outputs[h] = pred_df
-                    model_tables[h] = model_table
+        for h in sorted(forecast_results):
+            pred_df, summary, model_table = forecast_results[h]
+            if summary:
+                forecast_summaries.append(summary)
+                forecast_outputs[h] = pred_df
+                model_tables[h] = model_table
 
         if not forecast_summaries:
             st.warning("The common sample is insufficient for walk-forward validation. Extend the start date or choose an instrument with a longer history.")
@@ -1188,7 +1241,7 @@ with tabs[4]:
                     },
                     na_rep="N/A",
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1207,8 +1260,8 @@ with tabs[4]:
                 ffig = px.line(chart_df, x=chart_df.index, y=chart_df.columns, title=f"{h}D Walk-Forward Forecast vs Realized Log Return")
                 ffig.update_layout(template="plotly_white", height=480, hovermode="x unified", legend_title_text="")
                 ffig.update_yaxes(title="Forward Log Return %")
-                st.plotly_chart(ffig, use_container_width=True)
-                st.dataframe(model_tables[h].style.format({"Forecast Log Return %": "{:,.3f}", "Ensemble Weight %": "{:,.1f}"}), use_container_width=True, hide_index=True)
+                st.plotly_chart(ffig, width="stretch")
+                st.dataframe(model_tables[h].style.format({"Forecast Log Return %": "{:,.3f}", "Ensemble Weight %": "{:,.1f}"}), width="stretch", hide_index=True)
 
 # 6) LOG RETURN DIFFERENCE ±2 SIGMA
 with tabs[5]:
@@ -1232,7 +1285,7 @@ with tabs[5]:
     fig.add_trace(go.Scatter(x=selected_df.index[lower_breach.fillna(False)], y=(diff[lower_breach.fillna(False)] * 100.0), mode="markers", name="Lower Breach", marker=dict(color="#176b45", size=8, symbol="triangle-down")))
     fig.update_layout(title=f"{selected_name} — Δ Log Return with {log_band_window}D Mean ± 2σ", template="plotly_white", height=620, hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1.0, xanchor="right"))
     fig.update_yaxes(title="Return Difference %")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     future_5 = selected_df["Analysis Price"].shift(-5) / selected_df["Analysis Price"] - 1.0
     future_20 = selected_df["Analysis Price"].shift(-20) / selected_df["Analysis Price"] - 1.0
@@ -1250,7 +1303,7 @@ with tabs[5]:
                 "Positive Forward 20D %": float((resolved["Fwd 20D"] > 0).mean() * 100.0) if len(resolved) else np.nan,
             }
         )
-    st.dataframe(pd.DataFrame(breach_stats).style.format({c: "{:,.2f}" for c in breach_stats[0] if c not in ["Event", "Resolved Events"]}, na_rep="N/A"), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(breach_stats).style.format({c: "{:,.2f}" for c in breach_stats[0] if c not in ["Event", "Resolved Events"]}, na_rep="N/A"), width="stretch", hide_index=True)
 
 # 7) CROSS-ASSET MATRIX
 with tabs[6]:
@@ -1271,7 +1324,7 @@ with tabs[6]:
     corr_matrix = cross.tail(lookback).corr()
     heat = px.imshow(corr_matrix, text_auto=".2f", color_continuous_scale="RdBu", zmin=-1, zmax=1, title=f"Cross-Asset Correlation Matrix — Latest {lookback} Common Daily Observations")
     heat.update_layout(template="plotly_white", height=650)
-    st.plotly_chart(heat, use_container_width=True)
+    st.plotly_chart(heat, width="stretch")
 
     rolling_selected = pd.DataFrame(index=cross.index)
     for col in cross.columns:
@@ -1280,7 +1333,7 @@ with tabs[6]:
     roll_fig = px.line(rolling_selected, x=rolling_selected.index, y=rolling_selected.columns, title=f"{selected_name} — 60D Rolling Cross-Asset Correlations")
     roll_fig.update_layout(template="plotly_white", height=560, hovermode="x unified", legend_title_text="")
     roll_fig.update_yaxes(range=[-1, 1], title="Correlation")
-    st.plotly_chart(roll_fig, use_container_width=True)
+    st.plotly_chart(roll_fig, width="stretch")
 
 # 8) MODEL VALIDATION
 with tabs[7]:
@@ -1288,24 +1341,23 @@ with tabs[7]:
     st.markdown('<div class="section-note">A model is not accepted merely because it fits the historical sample. The primary evidence is walk-forward, out-of-sample performance against the historical-mean benchmark.</div>', unsafe_allow_html=True)
     validation_rows = []
     if forecast_horizons:
-        with st.spinner("Calculating validation statistics..."):
-            for h in sorted(forecast_horizons):
-                pred_df, summary, _ = walk_forward_forecast(selected_df, dxy_df, tnx_df, h, min_train=400, max_oos=max_oos)
-                if summary:
-                    validation_rows.append(
-                        {
-                            "Horizon": h,
-                            "OOS Observations": summary["OOS Observations"],
-                            "OOS R2 vs Mean %": summary["OOS R2"] * 100.0,
-                            "RMSE %": summary["RMSE"] * 100.0,
-                            "MAE %": summary["MAE"] * 100.0,
-                            "Directional Accuracy %": summary["Directional Accuracy"] * 100.0,
-                            "Forecast Correlation": summary["Forecast Correlation"],
-                            "Residual Std %": summary["Residual Std"] * 100.0,
-                            "Ridge Alpha": summary["Ridge Alpha"],
-                            "Status": "PASS" if summary["OOS R2"] > 0 and summary["Directional Accuracy"] >= 0.52 else "REVIEW",
-                        }
-                    )
+        for h in sorted(forecast_results):
+            pred_df, summary, _ = forecast_results[h]
+            if summary:
+                validation_rows.append(
+                {
+                        "Horizon": h,
+                        "OOS Observations": summary["OOS Observations"],
+                        "OOS R2 vs Mean %": summary["OOS R2"] * 100.0,
+                        "RMSE %": summary["RMSE"] * 100.0,
+                        "MAE %": summary["MAE"] * 100.0,
+                        "Directional Accuracy %": summary["Directional Accuracy"] * 100.0,
+                        "Forecast Correlation": summary["Forecast Correlation"],
+                        "Residual Std %": summary["Residual Std"] * 100.0,
+                        "Ridge Alpha": summary["Ridge Alpha"],
+                        "Status": "PASS" if summary["OOS R2"] > 0 and summary["Directional Accuracy"] >= 0.52 else "REVIEW",
+                    }
+                )
     if validation_rows:
         validation_df = pd.DataFrame(validation_rows)
         st.dataframe(validation_df.style.format({
@@ -1316,12 +1368,12 @@ with tabs[7]:
             "Forecast Correlation": "{:,.3f}",
             "Residual Std %": "{:,.2f}",
             "Ridge Alpha": "{:,.2f}",
-        }, na_rep="N/A"), use_container_width=True, hide_index=True)
+        }, na_rep="N/A"), width="stretch", hide_index=True)
 
         val_fig = px.bar(validation_df, x="Horizon", y="OOS R2 vs Mean %", color="Status", barmode="group", title="Out-of-Sample R² by Forecast Horizon")
         val_fig.add_hline(y=0.0, line_dash="dot", line_color="#667085")
         val_fig.update_layout(template="plotly_white", height=450)
-        st.plotly_chart(val_fig, use_container_width=True)
+        st.plotly_chart(val_fig, width="stretch")
     else:
         st.info("No validation result is available for the current date range and horizon selection.")
 
@@ -1341,13 +1393,13 @@ with tabs[7]:
         columns=["Control", "Implementation"],
     )
     st.markdown("#### Methodology Controls")
-    st.dataframe(methodology, use_container_width=True, hide_index=True)
+    st.dataframe(methodology, width="stretch", hide_index=True)
 
 # 9) DATA GOVERNANCE
 with tabs[8]:
     st.subheader("Data Governance and Download Center")
     st.markdown('<div class="section-note">The table below records the actual observations retrieved from Yahoo Finance. Failed instruments remain visible and are not replaced with proxies or synthetic series.</div>', unsafe_allow_html=True)
-    st.dataframe(governance, use_container_width=True, hide_index=True)
+    st.dataframe(governance, width="stretch", hide_index=True)
 
     selected_export = selected_df.copy()
     selected_export.index.name = "Date"
@@ -1379,4 +1431,4 @@ with tabs[8]:
         )
 
 st.markdown("---")
-st.caption(f"By MK FinTECH LabGEN@2026 Istanbul · {APP_NAME} V{APP_VERSION} · Yahoo Finance daily market observations only · Not investment advice")
+st.caption(f"By MK FinTECH LabGEN@2026 Istanbul · {APP_NAME} V{APP_VERSION} · Yahoo Finance daily market observations only · Single-thread cloud numerical engine · Not investment advice")

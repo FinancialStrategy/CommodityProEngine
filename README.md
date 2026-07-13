@@ -1,39 +1,18 @@
-# CommodityMacroPro Institutional V1.0
+# CommodityMacroPro Institutional V1.0.1
 
-A hedge-fund style Streamlit application for daily Yahoo Finance analysis of:
+Streamlit Cloud stability update for the Yahoo Finance commodity/DXY/UST10Y research engine.
 
-- Gold Futures (`GC=F`)
-- Silver Futures (`SI=F`)
-- Platinum Futures (`PL=F`)
-- WTI Crude Oil Futures (`CL=F`)
-- Copper Futures (`HG=F`)
-- US Dollar Index (`DX-Y.NYB`)
-- US Treasury 10Y Yield (`^TNX`)
+## Stability changes
 
-## Core tabs
+- Forecast and validation tabs now share one walk-forward calculation per horizon.
+- BLAS/OpenMP numerical libraries are restricted to one thread before NumPy/SciPy import.
+- Ridge uses the stable LSQR solver on contiguous float64 arrays.
+- Macro regressions run with bounded native threads.
+- Walk-forward OOS window is capped at 240 observations and defaults to 120.
+- Memory cleanup is applied during long walk-forward runs.
+- Streamlit `width="stretch"` replaces deprecated `use_container_width=True`.
+- Cloud packages are pinned to a tested conservative numerical stack, including NumPy 1.26.4 and PyArrow 18.1.0.
 
-1. Executive Dashboard
-2. Smart Price Structure
-3. EWMA Volatility
-4. DXY Relationship
-5. Forecast Laboratory
-6. Log Return Difference ±2σ
-7. Cross-Asset Matrix
-8. Model Validation
-9. Data Governance
+## Deployment
 
-## Data discipline
-
-- Yahoo Finance daily observations only
-- `auto_adjust=False`
-- No synthetic prices
-- No proxy fallback
-- No forward filling of returns
-- UST10Y is transformed to daily basis-point changes
-
-## Run
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+Upload `app.py` and `requirements.txt` to the root of the Streamlit Cloud repository, commit, then reboot the app.
